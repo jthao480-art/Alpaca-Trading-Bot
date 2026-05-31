@@ -1,0 +1,10 @@
+{
+  "pythonVersion": "3.11",
+  "venvPath": "..",
+  "venv": ".venv",
+  "typeCheckingMode": "off",
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "reportUndefinedVariable": "warning",
+  "extraPaths": ["."]
+}
