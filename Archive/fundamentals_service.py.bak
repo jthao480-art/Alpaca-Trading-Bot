@@ -1,0 +1,53 @@
+"""
+services/fundamentals_service.py – Fetches basic fundamental data.
+Uses Alpaca's snapshot endpoint (P/E approximation via price/eps).
+"""
+from __future__ import annotations
+import logging
+from typing import Optional
+
+import httpx
+
+import config
+
+logger = logging.getLogger(__name__)
+
+_HEADERS = {
+    "APCA-API-KEY-ID": config.ALPACA_API_KEY,
+    "APCA-API-SECRET-KEY": config.ALPACA_SECRET_KEY,
+}
+
+
+async def get_snapshot(symbol: str) -> Optional[dict]:
+    """Return Alpaca snapshot dict or None."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"https://data.alpaca.markets/v2/stocks/{symbol}/snapshot",
+                headers=_HEADERS,
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception:
+        logger.exception("fundamentals_service: failed snapshot for %s", symbol)
+        return None
+
+
+def score_fundamentals(snapshot: dict) -> float:
+    """
+    Simple heuristic: checks daily change % and 52w position.
+    Returns 0..1. 0.5 = neutral.
+    """
+    try:
+        daily = snapshot.get("dailyBar", {})
+        prev = snapshot.get("prevDailyBar", {})
+        close = daily.get("c", 0)
+        prev_close = prev.get("c", close)
+        if prev_close == 0:
+            return 0.5
+        change_pct = (close - prev_close) / prev_close
+        # Map [-5%, +5%] to [0.1, 0.9]
+        score = 0.5 + change_pct * 8
+        return max(0.1, min(0.9, score))
+    except Exception:
+        return 0.5

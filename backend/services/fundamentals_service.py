@@ -1,46 +1,78 @@
-from typing import Optional
+from __future__ import annotations
+
+from typing import Any
+
 from .auth import alpaca_request_async
 
-async def get_symbol_summary(symbol: str) -> Optional[dict]:
+
+def _safe_float(value: Any, default: float | None = None) -> float | None:
     try:
-        response = await alpaca_request_async("GET", f"/v1beta1/stocks/{symbol}/stats", use_data_api=True)
-        if response.status_code in [401, 404]: return None
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+async def get_snapshot(symbol: str) -> dict[str, Any]:
+    try:
+        response = await alpaca_request_async(
+            "GET",
+            f"/v2/stocks/{symbol}/snapshot",
+            use_data_api=True,
+        )
         response.raise_for_status()
-        return response.json().get("stats")
-    except Exception as e:
-        print(f"Error: {e}")
-        return None
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
 
-async def get_snapshot(symbol: str) -> Optional[dict]:
-    try:
-        response = await alpaca_request_async("GET", f"/v1beta1/stocks/{symbol}/snapshot", use_data_api=True)
-        if response.status_code in [401, 404]: return None
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"Error: {e}")
-        return None
 
-async def get_market_cap(symbol: str) -> Optional[float]:
-    s = await get_symbol_summary(symbol)
-    return s.get("market_cap") if s else None
+def score_fundamentals(snapshot: dict[str, Any]) -> float:
+    if not isinstance(snapshot, dict) or not snapshot:
+        return 0.5
 
-async def get_pe_ratio(symbol: str) -> Optional[float]:
-    s = await get_symbol_summary(symbol)
-    return s.get("pe_ratio") if s else None
+    score = 0.5
 
-async def score_fundamentals(symbol: str) -> dict:
-    try:
-        summary = await get_symbol_summary(symbol)
-        if not summary: return {"symbol": symbol, "score": 50.0, "label": "hold", "pe_ratio": None, "market_cap": None, "price_to_book": None, "revenue_ttm": None}
-        pe, mc, pb = summary.get("pe_ratio"), summary.get("market_cap"), summary.get("price_to_book")
-        score = 50.0
-        if pe: score += 15 if 10 <= pe <= 25 else 10 if pe < 10 else -10 if pe > 30 else 0
-        if mc: score += 10 if mc > 10e9 else 5 if mc > 2e9 else -10 if mc < 300e6 else 0
-        if pb: score += 10 if 1 <= pb <= 3 else 5 if pb < 1 else -5 if pb > 5 else 0
-        score = max(0, min(100, score))
-        label = "strong_buy" if score >= 80 else "buy" if score >= 65 else "hold" if score >= 40 else "sell" if score >= 20 else "strong_sell"
-        return {"symbol": symbol, "score": round(score, 1), "label": label, "pe_ratio": pe, "market_cap": mc, "price_to_book": pb, "revenue_ttm": summary.get("revenue_ttm")}
-    except Exception as e:
-        print(f"Error: {e}")
-        return {"symbol": symbol, "score": 50.0, "label": "hold", "pe_ratio": None, "market_cap": None, "price_to_book": None, "revenue_ttm": None}
+    daily = snapshot.get("dailyBar") or snapshot.get("daily_bar") or {}
+    prev_daily = snapshot.get("prevDailyBar") or snapshot.get("previousDailyBar") or snapshot.get("prev_daily_bar") or {}
+
+    close = _safe_float(daily.get("c"))
+    open_ = _safe_float(daily.get("o"))
+    prev_close = _safe_float(prev_daily.get("c"))
+
+    if close is not None and open_ is not None and open_ > 0:
+        intraday_change = (close - open_) / open_
+        score += max(min(intraday_change * 2.0, 0.20), -0.20)
+
+    if close is not None and prev_close is not None and prev_close > 0:
+        gap_change = (close - prev_close) / prev_close
+        score += max(min(gap_change * 1.5, 0.15), -0.15)
+
+    latest_trade = snapshot.get("latestTrade") or snapshot.get("latest_trade") or {}
+    latest_quote = snapshot.get("latestQuote") or snapshot.get("latest_quote") or {}
+
+    trade_price = _safe_float(latest_trade.get("p"))
+    bid = _safe_float(latest_quote.get("bp"))
+    ask = _safe_float(latest_quote.get("ap"))
+
+    if trade_price is not None and bid is not None and ask is not None and ask > bid:
+        mid = (bid + ask) / 2.0
+        spread = (ask - bid) / mid if mid > 0 else 0.0
+        if trade_price > mid:
+            score += 0.05
+        else:
+            score -= 0.05
+        if spread > 0.01:
+            score -= 0.05
+
+    minute_bar = snapshot.get("minuteBar") or snapshot.get("minute_bar") or {}
+    minute_vwap = _safe_float(minute_bar.get("vw"))
+    minute_close = _safe_float(minute_bar.get("c"))
+    if minute_vwap is not None and minute_close is not None and minute_vwap > 0:
+        if minute_close > minute_vwap:
+            score += 0.05
+        else:
+            score -= 0.05
+
+    return max(0.0, min(1.0, round(score, 4)))

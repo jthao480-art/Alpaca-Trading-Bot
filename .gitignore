@@ -1,59 +1,31 @@
-# Python bytecode / cache
+﻿# Environment
+.env
+.env.local
+
+# Ledger files (use Railway persistent volume)
+blacklist.json
+deferred_stops.json
+data/trade_ledger.json
+*.log
+debug_*.log
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.pyc.*
-*$py.class
-
-# Virtual environments
+.Python
+*.egg-info/
+dist/
+build/
 .venv/
 venv/
-env/
 
-# IDE / editor
+# VS Code
 .vscode/
-.idea/
-*.swp
-*.swo
 
-# OS files
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-logs/
-
-# Test / tooling caches
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# Backups
-*.bak
-*.backup
-*~
-
-# Local secrets
-.env
-
-# Local runtime data
-trading_bot.db
-backend/output/
-output/
-
-# Model artifacts
-models/*.pkl
-models/*.joblib
-models/*.sav
-
-# Extra folders you do not want tracked
-frontend/
-Archive/
-
-# Optional extras
-package-lock.json
-node_modules/
+# Test files
+test_*.py
+debug_*.py
+check_*.py
+fix_*.py

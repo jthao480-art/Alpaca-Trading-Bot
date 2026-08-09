@@ -1,0 +1,63 @@
+"""
+ws_bridge.py – WebSocket server that streams bus events to connected clients.
+"""
+from __future__ import annotations
+import asyncio
+import json
+import logging
+from typing import Set
+
+import websockets
+import websockets.server
+
+import event_bus as eb
+from . import config
+
+logger = logging.getLogger(__name__)
+
+_clients: Set[websockets.WebSocketServerProtocol] = set()
+
+
+def _on_event(topic: str, payload) -> None:
+    """Called by the event bus for every published event."""
+    msg = json.dumps({"topic": topic, "payload": payload}, default=str)
+    asyncio.create_task(_broadcast(msg))
+
+
+async def _broadcast(msg: str) -> None:
+    dead = set()
+    for ws in _clients.copy():
+        try:
+            await ws.send(msg)
+        except websockets.exceptions.ConnectionClosed:
+            dead.add(ws)
+    _clients.difference_update(dead)
+
+
+async def _handler(
+    websocket: websockets.WebSocketServerProtocol,
+    path: str,
+) -> None:
+    _clients.add(websocket)
+    logger.info("WS client connected: %s  total=%d", websocket.remote_address, len(_clients))
+    try:
+        async for _ in websocket:
+            pass   # client messages ignored; this is a one-way stream
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        _clients.discard(websocket)
+        logger.info("WS client disconnected: %s  total=%d", websocket.remote_address, len(_clients))
+
+
+async def start_ws_server() -> None:
+    """Register bus listener and start WS server."""
+    eb.bus.subscribe_all(_on_event)
+    server = await websockets.serve(
+        _handler,
+        config.WS_HOST,
+        config.WS_PORT,
+    )
+    logger.info("WebSocket bridge listening on ws://%s:%d", config.WS_HOST, config.WS_PORT)
+    await server.wait_closed()
+

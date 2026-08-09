@@ -1,42 +1,36 @@
-"""
-schemas.py – Shared Pydantic models used across agents, orchestrator, and API.
-"""
 from __future__ import annotations
-from datetime import datetime
+
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
 from pydantic import BaseModel, Field
 
 
-# ---------------------------------------------------------------------------
-# Agent signal
-# ---------------------------------------------------------------------------
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class AgentSignal(BaseModel):
     agent: str
     symbol: str
-    score: float                          # 0.0 – 1.0
-    direction: str                        # "buy" | "sell" | "hold"
+    score: float
+    direction: str
     confidence: float = 0.5
     reason: str = ""
     metadata: Dict[str, Any] = Field(default_factory=dict)
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
 
 
-# ---------------------------------------------------------------------------
-# Coordinator decision
-# ---------------------------------------------------------------------------
 class CoordinatorDecision(BaseModel):
     symbol: str
-    action: str                           # "buy" | "sell" | "hold"
+    action: str
     weighted_score: float
     signals: List[AgentSignal] = Field(default_factory=list)
     veto: bool = False
     veto_reason: str = ""
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
 
 
-# ---------------------------------------------------------------------------
-# Trade record
-# ---------------------------------------------------------------------------
 class TradeRecord(BaseModel):
     id: Optional[int] = None
     symbol: str
@@ -46,42 +40,33 @@ class TradeRecord(BaseModel):
     exit_price: Optional[float] = None
     take_profit: float
     stop_loss: float
-    status: str = "open"                  # "open" | "closed" | "cancelled"
+    status: str = "open"
     pnl: Optional[float] = None
     alpaca_order_id: Optional[str] = None
-    entry_ts: datetime = Field(default_factory=datetime.utcnow)
+    entry_ts: datetime = Field(default_factory=utc_now)
     exit_ts: Optional[datetime] = None
     features: Dict[str, Any] = Field(default_factory=dict)
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# State snapshot
-# ---------------------------------------------------------------------------
 class StateSnapshot(BaseModel):
     open_positions: Dict[str, TradeRecord] = Field(default_factory=dict)
     daily_pnl: float = 0.0
     daily_loss_hit: bool = False
     last_scan_ts: Optional[datetime] = None
     model_version: str = "unknown"
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
 
 
-# ---------------------------------------------------------------------------
-# Event envelope published on the bus
-# ---------------------------------------------------------------------------
 class BusEvent(BaseModel):
     topic: str
     payload: Dict[str, Any]
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
 
 
-# ---------------------------------------------------------------------------
-# Learning summary
-# ---------------------------------------------------------------------------
 class LearningSummary(BaseModel):
     model_version: str
-    trained_at: datetime = Field(default_factory=datetime.utcnow)
+    trained_at: datetime = Field(default_factory=utc_now)
     n_samples: int = 0
     accuracy: Optional[float] = None
     notes: str = ""

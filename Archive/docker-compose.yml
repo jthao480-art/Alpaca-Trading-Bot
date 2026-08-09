@@ -1,0 +1,34 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: tradingbot_backend
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./output:/app/output
+    ports:
+      - "${API_PORT:-8000}:8000"
+      - "${WS_PORT:-8765}:8765"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: tradingbot_frontend
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_WS_URL=ws://backend:8765
+      - NEXT_PUBLIC_API_URL=http://backend:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend

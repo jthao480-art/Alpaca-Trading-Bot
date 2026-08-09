@@ -1,0 +1,64 @@
+"""
+services/bars_service.py – Fetches OHLCV bars from Alpaca.
+"""
+from __future__ import annotations
+import logging
+from datetime import datetime, timedelta
+from typing import List, Optional
+
+import httpx
+
+import config
+
+logger = logging.getLogger(__name__)
+
+_BASE = "https://data.alpaca.markets/v2"
+_HEADERS = {
+    "APCA-API-KEY-ID": config.ALPACA_API_KEY,
+    "APCA-API-SECRET-KEY": config.ALPACA_SECRET_KEY,
+}
+
+
+async def get_bars(
+    symbol: str,
+    timeframe: str = "1Min",
+    limit: int = 100,
+) -> List[dict]:
+    """Return a list of OHLCV dicts or [] on error."""
+    end = datetime.utcnow()
+    start = end - timedelta(days=5)
+    params = {
+        "timeframe": timeframe,
+        "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limit": limit,
+        "feed": "iex",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{_BASE}/stocks/{symbol}/bars",
+                headers=_HEADERS,
+                params=params,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("bars", [])
+    except Exception:
+        logger.exception("bars_service: failed to fetch bars for %s", symbol)
+        return []
+
+
+async def get_latest_quote(symbol: str) -> Optional[dict]:
+    """Return latest bid/ask quote dict or None."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{_BASE}/stocks/{symbol}/quotes/latest",
+                headers=_HEADERS,
+            )
+            resp.raise_for_status()
+            return resp.json().get("quote")
+    except Exception:
+        logger.exception("bars_service: failed to fetch quote for %s", symbol)
+        return None

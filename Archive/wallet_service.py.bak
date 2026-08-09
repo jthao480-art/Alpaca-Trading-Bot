@@ -1,0 +1,51 @@
+"""
+services/wallet_service.py – Fetches Alpaca account / portfolio info.
+"""
+from __future__ import annotations
+import logging
+from typing import Optional
+
+import httpx
+
+import config
+
+logger = logging.getLogger(__name__)
+
+_HEADERS = {
+    "APCA-API-KEY-ID": config.ALPACA_API_KEY,
+    "APCA-API-SECRET-KEY": config.ALPACA_SECRET_KEY,
+}
+
+
+async def get_account() -> Optional[dict]:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{config.ALPACA_BASE_URL}/v2/account",
+                headers=_HEADERS,
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception:
+        logger.exception("wallet_service: failed to fetch account")
+        return None
+
+
+async def get_portfolio_health() -> float:
+    """
+    Returns a health score 0..1 based on buying power vs equity ratio.
+    1.0 = full buying power, 0.0 = margin call territory.
+    """
+    account = await get_account()
+    if not account:
+        return 0.5  # neutral when unavailable
+    try:
+        equity = float(account.get("equity", 1))
+        buying_power = float(account.get("buying_power", 0))
+        if equity <= 0:
+            return 0.1
+        ratio = buying_power / (equity * 2)   # 2× because margin
+        return max(0.0, min(1.0, ratio))
+    except Exception:
+        logger.exception("wallet_service: score calculation failed")
+        return 0.5

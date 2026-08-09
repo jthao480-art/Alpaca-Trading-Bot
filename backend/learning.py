@@ -1,109 +1,101 @@
-"""
-learning.py – Monday retraining / recalibration loop.
-Loads closed trades, retrains the model, saves artifact, notifies event bus.
-"""
 from __future__ import annotations
+
+import json
 import logging
-import os
-import uuid
+from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Optional
-from xml.parsers.expat import model
-
-import joblib
-import numpy as np
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.model_selection import cross_val_score
-
-from . import config
-from . import event_bus as eb
-from .db.trades_repo import get_closed_trades, insert_learning_run
-from .schemas import LearningSummary
-from .services.model_service import model_service
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-_MIN_SAMPLES = 20   # don't retrain on tiny datasets
+
+@dataclass
+class LearningEvent:
+    timestamp: str
+    symbol: str
+    action: str
+    score: float = 0.0
+    confidence: float = 0.0
+    status: str = ""
+    pnl: float = 0.0
+    meta: Optional[Dict[str, Any]] = None
 
 
-async def run_learning_job() -> None:
-    """Execute the full Monday retraining pipeline."""
-    logger.info("Learning job started.")
-    try:
-        trades = await get_closed_trades(limit=2000)
-        if len(trades) < _MIN_SAMPLES:
-            logger.info(
-                "Learning job: only %d closed trades – skipping (min %d).",
-                len(trades), _MIN_SAMPLES,
+class Learning:
+    def __init__(self, storage_path: str = "backend/db/learning_events.jsonl"):
+        self.storage_path = Path(storage_path)
+        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log_event(
+        self,
+        symbol: str,
+        action: str,
+        score: float = 0.0,
+        confidence: float = 0.0,
+        status: str = "",
+        pnl: float = 0.0,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> LearningEvent:
+        event = LearningEvent(
+            timestamp=datetime.utcnow().isoformat(),
+            symbol=symbol,
+            action=action,
+            score=float(score),
+            confidence=float(confidence),
+            status=status,
+            pnl=float(pnl),
+            meta=meta or {},
+        )
+        with self.storage_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(event)) + "\n")
+        return event
+
+    def load_events(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        if not self.storage_path.exists():
+            return []
+        rows = []
+        with self.storage_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
+        return rows[-limit:]
+
+    def summarize(self, limit: int = 1000) -> Dict[str, Any]:
+        events = self.load_events(limit=limit)
+        total = len(events)
+        buys = sum(1 for e in events if e.get("action") == "buy")
+        sells = sum(1 for e in events if e.get("action") == "sell")
+        holds = sum(1 for e in events if e.get("action") == "hold")
+        pnl = sum(float(e.get("pnl", 0) or 0) for e in events)
+        return {
+            "total_events": total,
+            "buys": buys,
+            "sells": sells,
+            "holds": holds,
+            "net_pnl": round(pnl, 2),
+        }
+
+    def update_from_run(self, run_result: Dict[str, Any]) -> int:
+        results = run_result.get("results", []) if isinstance(run_result, dict) else []
+        count = 0
+        for r in results:
+            symbol = r.get("symbol", "")
+            action = r.get("action", r.get("status", ""))
+            if not symbol:
+                continue
+            self.log_event(
+                symbol=symbol,
+                action=action,
+                score=r.get("score", 0.0),
+                confidence=r.get("confidence", 0.0),
+                status=r.get("status", ""),
+                meta=r,
             )
-            return
-
-        X, y = _build_dataset(trades)
-        if X is None or len(X) < _MIN_SAMPLES:
-            logger.info("Learning job: insufficient feature data – skipping.")
-            return
-
-        model = GradientBoostingClassifier(
-            n_estimators=100,
-            max_depth=3,
-            learning_rate=0.1,
-            random_state=42,
-        )
-
-        # Cross-validation accuracy
-        scores = cross_val_score(model, X, y, cv=min(5, len(X) // 10 or 2))
-        accuracy = float(np.mean(scores))
-
-        if y is None:
-            raise ValueError("Training labels are missing")
-        model.fit(X, y)
-
-        # Save model
-        os.makedirs(os.path.dirname(config.MODEL_PATH) or ".", exist_ok=True)
-        joblib.dump(model, config.MODEL_PATH)
-        logger.info("Learning job: model saved to %s  accuracy=%.3f", config.MODEL_PATH, accuracy)
-
-        # Reload live model service
-        model_service.reload()
-        version = model_service.version
-
-        summary = LearningSummary(
-            model_version=version,
-            n_samples=len(X),
-            accuracy=accuracy,
-            notes=f"Retrained on {len(trades)} trades; CV accuracy={accuracy:.3f}",
-        )
-        await insert_learning_run(summary)
-        await eb.bus.publish(
-            eb.TOPIC_LEARNING_SUMMARY,
-            summary.model_dump(mode="json"),
-        )
-        logger.info("Learning job complete: version=%s accuracy=%.3f", version, accuracy)
-
-    except Exception:
-        logger.exception("Learning job failed.")
-
-
-def _build_dataset(trades):
-    """
-    Build X (feature matrix) and y (labels) from closed trades.
-    Label = 1 if pnl > 0, else 0.
-    """
-    feature_keys = [
-        "news_score", "wallet_score", "momentum_score",
-        "volume_score", "forecast_score", "fundamentals_score",
-    ]
-    rows, labels = [], []
-    for t in trades:
-        if t.pnl is None:
-            continue
-        feats = t.features
-        row = [feats.get(k, 0.5) for k in feature_keys]
-        rows.append(row)
-        labels.append(1 if t.pnl > 0 else 0)
-
-    if not rows:
-        return None, None
-
-    return np.array(rows, dtype=float), np.array(labels, dtype=int)
-
+            count += 1
+        return count

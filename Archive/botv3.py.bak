@@ -1,0 +1,126 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+from datetime import date, datetime, time as dt_time
+from pathlib import Path
+
+import uvicorn
+
+from backend import config
+from backend.api import app as fastapi_app, set_state_store
+from backend.db.init_db import init_db
+from backend.learning import run_learning_job
+from backend.orchestrator import Orchestrator
+from backend import event_bus as eb
+from backend.services.model_service import model_service
+from backend.state_store import StateStore
+from backend.ws_bridge import start_ws_server
+
+
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)-8s %(name)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("botv3")
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _is_market_hours() -> bool:
+    now = datetime.utcnow()
+    if now.weekday() >= 5:
+        return False
+    after_open = (now.hour, now.minute) >= (13, 30)
+    before_close = (now.hour, now.minute) < (20, 5)
+    return after_open and before_close
+
+
+def _next_monday_preopen() -> datetime:
+    now = datetime.utcnow()
+    days_ahead = (7 - now.weekday()) % 7
+    if days_ahead == 0 and now.time() >= dt_time(13, 25):
+        days_ahead = 7
+    target = now.replace(hour=13, minute=0, second=0, microsecond=0)
+    return target + __import__("datetime").timedelta(days=days_ahead)
+
+
+async def _heartbeat() -> None:
+    while True:
+        await eb.bus.publish(eb.TOPIC_HEARTBEAT, {"ts": datetime.utcnow().isoformat()})
+        await asyncio.sleep(30)
+
+
+async def _learning_scheduler() -> None:
+    last_run_date: date | None = None
+    while True:
+        now = datetime.utcnow()
+        if now.weekday() == 0 and now.hour == 13 and now.minute < 10:
+            today = now.date()
+            if last_run_date != today:
+                logger.info("Monday learning job triggered.")
+                await run_learning_job()
+                last_run_date = today
+        await asyncio.sleep(60)
+
+
+async def _scan_loop(orchestrator: Orchestrator) -> None:
+    while True:
+        try:
+            if _is_market_hours():
+                logger.info("Scanning symbols: %s", config.SYMBOLS)
+                await orchestrator.scan(config.SYMBOLS)
+            else:
+                logger.debug("Outside market hours - sleeping.")
+        except Exception:
+            logger.exception("Scan loop error")
+        await asyncio.sleep(config.SCAN_INTERVAL_SECONDS)
+
+
+async def main() -> None:
+    logger.info("=== TradingBot v3 starting ===")
+
+    await init_db(config.DATABASE_URL)
+
+    state = StateStore(config.STATE_PATH)
+    await state.load()
+    set_state_store(state)
+
+    model_service.load()
+    state.set_model_version(model_service.version)
+
+    orch = Orchestrator(state)
+
+    uvicorn_config = uvicorn.Config(
+        fastapi_app,
+        host=config.API_HOST,
+        port=config.API_PORT,
+        log_level="warning",
+        lifespan="on",
+    )
+    server = uvicorn.Server(uvicorn_config)
+
+    tasks = [
+        asyncio.create_task(server.serve(), name="uvicorn"),
+        asyncio.create_task(start_ws_server(), name="ws_bridge"),
+        asyncio.create_task(_scan_loop(orch), name="scan_loop"),
+        asyncio.create_task(_learning_scheduler(), name="learning_scheduler"),
+        asyncio.create_task(_heartbeat(), name="heartbeat"),
+    ]
+
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user.")

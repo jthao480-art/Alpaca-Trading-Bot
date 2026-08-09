@@ -1,0 +1,53 @@
+"""
+agents/forecast_agent.py – ML model-based price direction forecast.
+"""
+from __future__ import annotations
+from typing import Optional
+
+from .base import BaseAgent
+from ..schemas import AgentSignal
+from services.model_service import model_service
+from services.bars_service import get_bars
+
+
+class ForecastAgent(BaseAgent):
+    name = "forecast"
+
+    async def analyze(self, symbol: str) -> Optional[AgentSignal]:
+        try:
+            bars = await get_bars(symbol, timeframe="5Min", limit=30)
+            if len(bars) < 10:
+                return self._make_signal(symbol, 0.5, "hold", 0.3, "insufficient bars")
+
+            closes = [float(b["c"]) for b in bars]
+            volumes = [float(b.get("v", 0)) for b in bars]
+
+            # Simple feature set for the model
+            import numpy as np
+            returns = np.diff(closes) / np.array(closes[:-1])
+            features = {
+                "momentum_score": float(np.mean(returns[-5:]) * 20 + 0.5),
+                "volume_score":   float(min(volumes[-1] / (np.mean(volumes) + 1e-9) / 2, 1.0)),
+                "news_score":     0.5,   # placeholder; filled in by orchestrator if desired
+                "wallet_score":   0.5,
+                "forecast_score": 0.5,
+                "fundamentals_score": 0.5,
+            }
+            score = model_service.predict(features)
+            direction = "buy" if score > 0.58 else ("sell" if score < 0.46 else "hold")
+
+            return self._make_signal(
+                symbol=symbol,
+                score=score,
+                direction=direction,
+                confidence=0.8 if model_service.is_loaded else 0.4,
+                reason=f"model_score={score:.3f} model_ver={model_service.version}",
+                model_version=model_service.version,
+                model_loaded=model_service.is_loaded,
+            )
+        except Exception:
+            self.logger.exception("ForecastAgent failed for %s", symbol)
+            return None
+
+
+

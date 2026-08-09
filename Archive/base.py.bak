@@ -1,0 +1,42 @@
+"""
+agents/base.py – Abstract base class for all trading agents.
+"""
+from __future__ import annotations
+import logging
+from abc import ABC, abstractmethod
+from typing import Optional
+
+from schemas import AgentSignal
+
+
+class BaseAgent(ABC):
+    """All agents must implement `analyze(symbol) -> AgentSignal`."""
+
+    name: str = "base"
+
+    def __init__(self) -> None:
+        self.logger = logging.getLogger(f"agent.{self.name}")
+
+    @abstractmethod
+    async def analyze(self, symbol: str) -> Optional[AgentSignal]:
+        """Return an AgentSignal or None if data is unavailable."""
+        ...
+
+    def _make_signal(
+        self,
+        symbol: str,
+        score: float,
+        direction: str,
+        confidence: float = 0.5,
+        reason: str = "",
+        **metadata,
+    ) -> AgentSignal:
+        return AgentSignal(
+            agent=self.name,
+            symbol=symbol,
+            score=max(0.0, min(1.0, score)),
+            direction=direction,
+            confidence=max(0.0, min(1.0, confidence)),
+            reason=reason,
+            metadata=dict(metadata),
+        )

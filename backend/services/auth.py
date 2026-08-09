@@ -1,90 +1,36 @@
-from pathlib import Path
-import os
-import asyncio
-import requests
-from typing import Dict, Optional
+from __future__ import annotations
 
-from dotenv import load_dotenv
+from typing import Any
+import httpx
 
-load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env", override=True)
+from backend import config
 
 
-def _clean(value: Optional[str]) -> Optional[str]:
-    if value is None:
-        return None
-    value = value.strip()
-    return value or None
-
-
-def _normalize_base_url(url: Optional[str], default: str) -> str:
-    value = _clean(url) or default
-    return value.rstrip("/")
-
-
-def get_alpaca_headers() -> Dict[str, str]:
-    api_key = _clean(os.getenv("APCA_API_KEY_ID"))
-    secret_key = _clean(os.getenv("APCA_API_SECRET_KEY"))
-
-    if not api_key or not secret_key:
-        raise ValueError(
-            "Missing Alpaca credentials. Set APCA_API_KEY_ID and APCA_API_SECRET_KEY in .env."
-        )
-
+def get_alpaca_headers() -> dict[str, str]:
     return {
-        "APCA-API-KEY-ID": api_key,
-        "APCA-API-SECRET-KEY": secret_key,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
+        "APCA-API-KEY-ID": config.ALPACA_API_KEY or "",
+        "APCA-API-SECRET-KEY": config.ALPACA_SECRET_KEY or config.ALPACA_API_SECRET_KEY or "",
     }
 
 
-def get_alpaca_base_url() -> str:
-    return _normalize_base_url(
-        os.getenv("ALPACA_BASE_URL") or os.getenv("APCA_API_BASE_URL"),
-        "https://paper-api.alpaca.markets",
-    )
-
-
-def get_alpaca_data_base_url() -> str:
-    return _normalize_base_url(
-        os.getenv("ALPACA_DATA_BASE_URL"),
-        "https://data.alpaca.markets",
-    )
-
-
 def get_alpaca_data_feed() -> str:
-    return _clean(os.getenv("ALPACA_DATA_FEED")) or "iex"
+    return "iex"
 
 
-def alpaca_request(
-    method: str,
-    endpoint: str,
-    data: Optional[dict] = None,
-    params: Optional[dict] = None,
-    use_data_api: bool = False,
-) -> requests.Response:
-    headers = get_alpaca_headers()
-    base_url = get_alpaca_data_base_url() if use_data_api else get_alpaca_base_url()
-    url = f"{base_url}{endpoint if endpoint.startswith('/') else '/' + endpoint}"
-    return requests.request(
-        method=method.upper(),
-        url=url,
-        headers=headers,
-        json=data if data else None,
-        params=params,
-        timeout=30,
-    )
+def _get_base_url(use_data_api: bool = False) -> str:
+    return config.ALPACA_DATA_URL if use_data_api else config.ALPACA_BASE_URL
 
 
 async def alpaca_request_async(
     method: str,
-    endpoint: str,
-    data: Optional[dict] = None,
-    params: Optional[dict] = None,
+    path: str,
+    params: dict[str, Any] | None = None,
     use_data_api: bool = False,
-) -> requests.Response:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None,
-        lambda: alpaca_request(method, endpoint, data, params, use_data_api),
-    )
+):
+    base_url = _get_base_url(use_data_api=use_data_api).rstrip("/")
+    path = path if path.startswith("/") else f"/{path}"
+    url = f"{base_url}{path}"
+
+    headers = get_alpaca_headers()
+    async with httpx.AsyncClient(headers=headers, timeout=30.0) as client:
+        return await client.request(method, url, params=params)

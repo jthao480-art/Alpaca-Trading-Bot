@@ -1,58 +1,127 @@
-from typing import Optional, List
-from datetime import datetime, timedelta
-from .auth import alpaca_request_async, get_alpaca_data_feed
+import asyncio
+import logging
+import time
+from datetime import datetime, timedelta, timezone
 
-async def get_bars(symbol: str, timeframe: str = "1Min", start: Optional[datetime] = None, end: Optional[datetime] = None, limit: int = 1000) -> Optional[List[dict]]:
-    try:
-        if start is None:
-            start = datetime.utcnow() - timedelta(days=30)
-        if end is None:
-            end = datetime.utcnow()
+from .auth import alpaca_request_async
+
+logger = logging.getLogger(__name__)
+
+
+class Bars_Service:
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._bars_cache = {}
+        self._news_cache = {}
+        self._cache_ttl_seconds = 45
+
+    def _cache_get(self, cache: dict, key):
+        item = cache.get(key)
+        if not item:
+            return None
+        ts, value = item
+        if time.time() - ts > self._cache_ttl_seconds:
+            cache.pop(key, None)
+            return None
+        return value
+
+    def _cache_set(self, cache: dict, key, value):
+        cache[key] = (time.time(), value)
+
+    async def _get_with_retry(self, url, *, params=None, cache=None, cache_key=None):
+        if cache is not None and cache_key is not None:
+            cached = self._cache_get(cache, cache_key)
+            if cached is not None:
+                return cached
+
+        delay = 1.5
+        last_exc = None
+
+        for attempt in range(1, 6):
+            try:
+                resp = await alpaca_request_async("GET", url, params=params, use_data_api=True)
+
+                if resp.status_code == 429:
+                    logger.warning(
+                        "429 on %s (attempt %s/5); backing off %.1fs",
+                        url,
+                        attempt,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                    continue
+
+                resp.raise_for_status()
+                data = resp.json()
+
+                if cache is not None and cache_key is not None:
+                    self._cache_set(cache, cache_key, data)
+
+                return data
+
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 5:
+                    raise
+                await asyncio.sleep(delay)
+                delay *= 2
+
+        raise last_exc
+
+    async def get_bars(self, symbol, start, end, timeframe="5Min", limit=60, feed="iex"):
+        path = f"/v2/stocks/{symbol}/bars"
         params = {
             "timeframe": timeframe,
-            "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "start": start,
+            "end": end,
             "limit": limit,
-            "feed": get_alpaca_data_feed(),
+            "feed": feed,
             "sort": "asc",
         }
-        response = await alpaca_request_async("GET", f"/v2/stocks/{symbol}/bars", params=params, use_data_api=True)
-        if response.status_code == 401:
-            print("ERROR: 401 Unauthorized from Alpaca data API.")
-            return None
-        response.raise_for_status()
-        return response.json().get("bars", [])
-    except Exception as e:
-        print(f"Error fetching bars for {symbol}: {e}")
-        return None
+        key = ("bars", symbol, start, end, timeframe, limit, feed)
+        return await self._get_with_retry(path, params=params, cache=self._bars_cache, cache_key=key)
 
-async def get_latest_bar(symbol: str, timeframe: str = "1Min") -> Optional[dict]:
-    bars = await get_bars(symbol, timeframe, limit=1)
-    return bars[0] if bars else None
+    async def get_news(self, symbol, start, end, limit=50):
+        path = "/v1beta1/news"
+        params = {
+            "symbols": symbol,
+            "start": start,
+            "end": end,
+            "limit": limit,
+            "sort": "desc",
+        }
+        key = ("news", symbol, start, end, limit)
+        return await self._get_with_retry(path, params=params, cache=self._news_cache, cache_key=key)
 
-async def get_recent_bars(symbol: str, timeframe: str = "1Min", count: int = 100) -> Optional[List[dict]]:
-    return await get_bars(symbol, timeframe, start=datetime.utcnow() - timedelta(days=7), end=datetime.utcnow(), limit=count)
 
-async def get_latest_quote(symbol: str) -> Optional[dict]:
-    try:
-        response = await alpaca_request_async("GET", f"/v1beta1/stocks/{symbol}/snapshot", use_data_api=True)
-        if response.status_code == 401:
-            return None
-        if response.status_code == 404:
-            return None
-        response.raise_for_status()
-        return response.json().get("latest_quote")
-    except Exception as e:
-        print(f"Error fetching quote for {symbol}: {e}")
-        return None
+_service = Bars_Service()
 
-async def get_latest_trade(symbol: str) -> Optional[dict]:
-    try:
-        response = await alpaca_request_async("GET", f"/v1beta1/stocks/{symbol}/snapshot", use_data_api=True)
-        if response.status_code in [401, 404]:
-            return None
-        response.raise_for_status()
-        return response.json().get("latest_trade")
-    except Exception as e:
-        print(f"Error fetching trade for {symbol}: {e}")
-        return None
+
+def _default_window(days: int = 7) -> tuple[str, str]:
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    return start.isoformat(), end.isoformat()
+
+
+async def get_bars(symbol, timeframe="5Min", limit=60, feed="iex"):
+    start, end = _default_window(7)
+    payload = await _service.get_bars(symbol, start, end, timeframe=timeframe, limit=limit, feed=feed)
+    return payload.get("bars", []) if isinstance(payload, dict) else []
+
+
+async def get_latest_bar(symbol, timeframe="5Min", limit=1, feed="iex"):
+    bars = await get_bars(symbol, timeframe=timeframe, limit=limit, feed=feed)
+    return bars[-1] if bars else {}
+
+
+async def get_latest_quote(*args, **kwargs):
+    raise NotImplementedError("get_latest_quote is not implemented in BarsService yet")
+
+
+async def get_latest_trade(*args, **kwargs):
+    raise NotImplementedError("get_latest_trade is not implemented in BarsService yet")
+
+
+async def get_recent_bars(symbol, timeframe="5Min", limit=60, feed="iex"):
+    return await get_bars(symbol, timeframe=timeframe, limit=limit, feed=feed)

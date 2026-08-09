@@ -1,30 +1,27 @@
-"""
-agents/momentum_agent.py – Watches price action (RSI, EMA crossover).
-"""
 from __future__ import annotations
-from typing import List, Optional
+
+from typing import Any, Optional
 
 import numpy as np
 
-from .base import BaseAgent
-from ..schemas import AgentSignal
-from ..services.bars_service import get_bars
+from backend.agents.base import BaseAgent
+from backend.services.bars_service import get_bars
 
 
-def _ema(prices: List[float], period: int) -> List[float]:
+def ema(prices: list[float], period: int) -> list[float]:
     if len(prices) < period:
         return prices
     k = 2 / (period + 1)
-    ema = [prices[0]]
+    out = [prices[0]]
     for p in prices[1:]:
-        ema.append(p * k + ema[-1] * (1 - k))
-    return ema
+        out.append((p * k) + (out[-1] * (1 - k)))
+    return out
 
 
-def _rsi(prices: List[float], period: int = 14) -> float:
+def rsi(prices: list[float], period: int = 14) -> float:
     if len(prices) < period + 1:
         return 50.0
-    deltas = np.diff(prices[-period - 1:])
+    deltas = np.diff(prices[-(period + 1):])
     gains = np.where(deltas > 0, deltas, 0.0)
     losses = np.where(deltas < 0, -deltas, 0.0)
     avg_gain = gains.mean()
@@ -32,50 +29,96 @@ def _rsi(prices: List[float], period: int = 14) -> float:
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1 + rs))
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 class MomentumAgent(BaseAgent):
     name = "momentum"
 
-    async def analyze(self, symbol: str) -> Optional[AgentSignal]:
+    async def analyze(self, symbol: str) -> Optional[dict[str, Any]]:
         try:
             bars = await get_bars(symbol, timeframe="5Min", limit=60)
-            if len(bars) < 20:
-                self.logger.warning("MomentumAgent: insufficient bars for %s", symbol)
-                return self._make_signal(symbol, 0.5, "hold", 0.3, "insufficient data")
+            if not bars or len(bars) < 20:
+                return self.signal_to_dict(
+                    self.make_signal(
+                        symbol=symbol,
+                        score=0.45,
+                        direction="hold",
+                        confidence=0.25,
+                        reason="insufficient bars",
+                        metadata={},
+                    )
+                )
 
-            closes = [float(b["c"]) for b in bars]
-            rsi = _rsi(closes)
-            ema9 = _ema(closes, 9)[-1]
-            ema21 = _ema(closes, 21)[-1]
+            closes = [float(b.get("c", 0) or 0) for b in bars]
+            volumes = [float(b.get("v", 0) or 0) for b in bars]
 
-            # Score: RSI normalised + EMA cross signal
-            rsi_score = 1 - (rsi / 100)   # low RSI → potential buy
-            ema_score = 1.0 if ema9 > ema21 else 0.0
-            score = 0.5 * rsi_score + 0.5 * ema_score
+            rsi_val = rsi(closes)
+            ema9 = ema(closes, 9)[-1]
+            ema21 = ema(closes, 21)[-1]
+            roc3 = ((closes[-1] - closes[-4]) / closes[-4] * 100.0) if len(closes) >= 4 and closes[-4] else 0.0
+            roc6 = ((closes[-1] - closes[-7]) / closes[-7] * 100.0) if len(closes) >= 7 and closes[-7] else 0.0
 
-            if score > 0.6:
+            recent_vol = float(np.mean(volumes[-3:]))
+            prior_vol = float(np.mean(volumes[-10:-3])) if len(volumes) >= 10 else float(np.mean(volumes[:-3])) if len(volumes) > 3 else recent_vol
+            if prior_vol <= 0:
+                prior_vol = 1.0
+            volume_ratio = recent_vol / prior_vol
+            volume_trend = recent_vol - prior_vol
+
+            bullish_trend = ema9 > ema21
+            early_momentum = roc3 > 0.25 or roc6 > 0.5
+            fresh_volume = volume_ratio >= 1.10 and volume_trend > 0
+
+            score = 0.45
+            if bullish_trend:
+                score += 0.12
+            if rsi_val < 62:
+                score += 0.08
+            if early_momentum:
+                score += 0.12
+            if fresh_volume:
+                score += 0.14
+            if volume_ratio >= 1.25:
+                score += 0.05
+
+            score = max(0.0, min(1.0, round(score, 4)))
+
+            if bullish_trend and fresh_volume and early_momentum and rsi_val < 68:
                 direction = "buy"
-            elif score < 0.4:
+                confidence = 0.82
+                reason = f"early momentum ROC3={roc3:.2f} ROC6={roc6:.2f} vol={volume_ratio:.2f}"
+                score = max(score, 0.60)
+            elif not bullish_trend and roc3 < -0.25 and volume_trend < 0:
                 direction = "sell"
+                confidence = 0.72
+                reason = f"momentum fading ROC3={roc3:.2f} vol={volume_ratio:.2f}"
+                score = min(score, 0.38)
             else:
                 direction = "hold"
+                confidence = 0.45
+                reason = f"mixed momentum RSI={rsi_val:.1f} ROC3={roc3:.2f} vol={volume_ratio:.2f}"
 
-            return self._make_signal(
+            signal = self.make_signal(
                 symbol=symbol,
                 score=score,
                 direction=direction,
-                confidence=0.75,
-                reason=f"RSI={rsi:.1f} EMA9={ema9:.2f} EMA21={ema21:.2f}",
-                rsi=round(rsi, 2),
-                ema9=round(ema9, 4),
-                ema21=round(ema21, 4),
+                confidence=confidence,
+                reason=reason,
+                metadata={
+                    "rsi": round(rsi_val, 2),
+                    "ema9": round(ema9, 4),
+                    "ema21": round(ema21, 4),
+                    "roc3": round(roc3, 4),
+                    "roc6": round(roc6, 4),
+                    "volume_ratio": round(volume_ratio, 4),
+                    "volume_trend": round(volume_trend, 4),
+                    "bullish_trend": bullish_trend,
+                    "early_momentum": early_momentum,
+                    "fresh_volume": fresh_volume,
+                },
             )
+            return self.signal_to_dict(signal)
         except Exception:
             self.logger.exception("MomentumAgent failed for %s", symbol)
             return None
-
-
-
-

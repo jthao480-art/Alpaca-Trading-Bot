@@ -90,7 +90,7 @@ Copy `.env.example` → `.env` and set your values:
 | Variable | Default | Description |
 |---|---|---|
 | `ALPACA_API_KEY` | — | **Required** |
-| `ALPACA_SECRET_KEY` | — | **Required** |
+| `ALPACA_API_SECRET_KEY` | — | **Required** |
 | `ALPACA_BASE_URL` | paper API | Switch to live URL for real money |
 | `SYMBOLS` | AAPL,MSFT,TSLA,NVDA,AMD | Comma-separated watchlist |
 | `BUY_THRESHOLD` | 0.58 | Weighted score to trigger buy |

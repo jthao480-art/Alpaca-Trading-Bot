@@ -1,42 +1,43 @@
-"""
-agents/fundamentals_agent.py – Watches valuation and earnings context.
-"""
 from __future__ import annotations
-from typing import Optional
+
+from typing import Any, Optional
 
 from .base import BaseAgent
-from ..schemas import AgentSignal
 from ..services.fundamentals_service import get_snapshot, score_fundamentals
 
 
 class FundamentalsAgent(BaseAgent):
     name = "fundamentals"
 
-    async def analyze(self, symbol: str) -> Optional[AgentSignal]:
+    async def analyze(self, symbol: str) -> Optional[dict[str, Any]]:
         try:
             snapshot = await get_snapshot(symbol)
             if not snapshot:
-                return self._make_signal(symbol, 0.5, "hold", 0.3, "snapshot unavailable")
+                return self.make_signal(
+                    symbol=symbol,
+                    score=0.5,
+                    direction="hold",
+                    confidence=0.3,
+                    reason="snapshot unavailable",
+                )
 
-            score = score_fundamentals(snapshot)
-            direction = "buy" if score > 0.6 else ("sell" if score < 0.4 else "hold")
+            score = float(score_fundamentals(snapshot) or 0.5)
+            direction = "buy" if score > 0.6 else "sell" if score < 0.4 else "hold"
+            daily = snapshot.get("dailyBar") or snapshot.get("daily_bar") or {}
 
-            daily = snapshot.get("dailyBar", {})
-            return self._make_signal(
+            return self.make_signal(
                 symbol=symbol,
                 score=score,
                 direction=direction,
                 confidence=0.65,
                 reason=f"fundamental_score={score:.2f}",
-                close=daily.get("c"),
-                open_=daily.get("o"),
-                high=daily.get("h"),
-                low=daily.get("l"),
+                metadata={
+                    "close": daily.get("c"),
+                    "open": daily.get("o"),
+                    "high": daily.get("h"),
+                    "low": daily.get("l"),
+                },
             )
         except Exception:
             self.logger.exception("FundamentalsAgent failed for %s", symbol)
             return None
-
-
-
-
