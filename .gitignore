@@ -29,3 +29,8 @@ test_*.py
 debug_*.py
 check_*.py
 fix_*.py
+
+node_modules/
+frontend/node_modules/
+.next/
+frontend/.next/
