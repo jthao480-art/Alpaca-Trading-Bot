@@ -43,6 +43,7 @@ from backend.services.trade_ledger_service import (
     is_in_cooldown,
     load_ledger,
     save_ledger,
+    _from_iso,
 )
 
 
@@ -880,6 +881,75 @@ class botV3:
         except Exception:
             logger.exception("_protect_positions failed")
 
+    def _count_trading_days(self, start: datetime, end: datetime) -> int:
+        """Count trading days between two datetimes, excluding weekends."""
+        count = 0
+        current = start.date()
+        end_date = end.date()
+        while current < end_date:
+            if current.weekday() < 5:  # Monday-Friday
+                count += 1
+            current += timedelta(days=1)
+        return count
+
+    async def _intraday_time_exit_pass(self, ledger: Any) -> None:
+        """Exit intraday positions after 5 trading days unless up >15%."""
+        try:
+            positions = await _get_open_positions()
+            pos_map = {p.get("symbol"): p for p in positions}
+            now = datetime.now(ET)
+
+            for symbol, entries in ledger.items():
+                if not isinstance(entries, list):
+                    continue
+                # Find open intraday entry
+                open_entry = next(
+                    (e for e in reversed(entries)
+                     if e.get("status") == "open"
+                     and str(e.get("strategy", "")).lower() == "intraday"),
+                    None,
+                )
+                if not open_entry:
+                    continue
+
+                # Check trading days held
+                created_at = _from_iso(open_entry.get("created_at"))
+                if not created_at:
+                    continue
+                trading_days = self._count_trading_days(created_at, now)
+                if trading_days < 5:
+                    continue
+
+                # Check if position still open
+                pos = pos_map.get(symbol)
+                if not pos:
+                    continue
+
+                qty = float(pos.get("qty", 0))
+                if qty <= 0:
+                    continue
+
+                # Hybrid rule — skip exit if up >15%
+                entry_price = float(open_entry.get("entry_price", 0) or 0)
+                current_price = float(pos.get("current_price", 0) or 0)
+                if entry_price > 0 and current_price > 0:
+                    gain_pct = (current_price - entry_price) / entry_price
+                    if gain_pct > 0.15:
+                        logger.info(
+                            "5-day exit skipped for %s — up %.1f%% (>15%% threshold), letting trailing stop run",
+                            symbol, gain_pct * 100,
+                        )
+                        continue
+
+                logger.info(
+                    "5-day time exit: %s held %d trading days, closing at market",
+                    symbol, trading_days,
+                )
+                await self._close_position_market(symbol, qty, "intraday_5day_exit", ledger)
+
+        except Exception:
+            logger.exception("_intraday_time_exit_pass failed")        
+
     async def _handle_signals(self, signals: list[dict[str, Any]]) -> None:
         global HALT_ENTRIES
         ledger = load_ledger()
@@ -908,6 +978,7 @@ class botV3:
 
         logger.debug("handle_signals_start signals=%d open_positions=%d", len(signals), len(open_positions))
         await self._liquidate_loser_sweep(ledger)
+        await self._intraday_time_exit_pass(ledger)
         await self._session_exit_pass(ledger)
         await self._end_of_day_sweep(ledger)
 
