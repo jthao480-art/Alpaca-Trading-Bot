@@ -9,7 +9,8 @@ from alpaca.trading.requests import GetAssetsRequest
 from alpaca.trading.enums import AssetClass, AssetStatus
 
 # Load exclusively from .env — shell env vars cannot override
-_env = dotenv_values(".env")
+import os
+_env = {**dotenv_values(".env"), **os.environ}
 
 def _get(key: str, default: str = "") -> str:
     return _env.get(key, default)
