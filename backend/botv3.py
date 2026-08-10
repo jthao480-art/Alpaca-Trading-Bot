@@ -51,6 +51,7 @@ ET = ZoneInfo("America/New_York")
 _PENDING_SELLS: set[str] = set()
 _PENDING_BUYS: set[str] = set()
 _BOUGHT_THIS_SESSION: set[str] = set()
+_LAST_LOSER_SWEEP: datetime | None = None
 
 MAX_POSITIONS = int(getattr(config, "MAX_POSITIONS", 150))
 DAILY_LOSS_LIMIT = float(getattr(config, "DAILY_LOSS_LIMIT", -2000))
@@ -508,13 +509,14 @@ class botV3:
 
     async def _liquidate_loser_sweep(self, ledger: Any) -> None:
         # Rate limit: only run once every 5 minutes to prevent SELL 0 spam
+        global _LAST_LOSER_SWEEP
         _now = datetime.now(ET)
-        if self._last_loser_sweep is not None:
-            elapsed = (_now - self._last_loser_sweep).total_seconds()
+        if _LAST_LOSER_SWEEP is not None:
+            elapsed = (_now - _LAST_LOSER_SWEEP).total_seconds()
             if elapsed < 300:
                 logger.debug("loser_sweep: skipping — ran %.0fs ago", elapsed)
                 return
-        self._last_loser_sweep = _now
+        _LAST_LOSER_SWEEP = _now
 
         positions = self._load_position_objects()
         if not positions:
