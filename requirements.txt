@@ -30,3 +30,4 @@ praw==8.0.2
 groq==1.5.0
 anthropic
 stripe==15.3.0
+vaderSentiment
