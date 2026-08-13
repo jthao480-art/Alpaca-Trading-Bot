@@ -60,6 +60,7 @@ USE_WAVE_PROVISIONAL = _env.get("USE_WAVE_PROVISIONAL", "true").lower() == "true
 USE_SURGE = _env.get("USE_SURGE", "true").lower() == "true"
 LOSER_EXIT_THRESHOLD = float(_env.get("LOSER_EXIT_THRESHOLD", "-0.05"))
 DATA_DIR = _env.get("DATA_DIR", ".")
+USE_ARES_BEARISH = _env.get("USE_ARES_BEARISH", "false").lower() == "true"
 
 @lru_cache(maxsize=1)
 def load_tradable_equities() -> list[str]:

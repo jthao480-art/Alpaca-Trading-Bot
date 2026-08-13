@@ -187,8 +187,19 @@ class AresAgent(BaseAgent):
                 )
 
             else:  # Bearish
+                # Check if bearish side is enabled
+                from backend import config as _cfg
+                if not getattr(_cfg, "USE_ARES_BEARISH", False):
+                    return self.make_signal(
+                        symbol=symbol,
+                        score=0.5,
+                        direction="hold",
+                        confidence=0.1,
+                        reason=f"Ares Bearish disabled — {days_up_streak}-day up-streak (score={ares_score:.1f})",
+                        metadata=metadata,
+                    )
                 # Up-streak underperformance — sell/short signal
-                normalized = (50.0 - ares_score) / 4.0  # 0.0 to 1.0
+                normalized = (50.0 - ares_score) / 4.0
                 signal_score = round(0.65 + normalized * 0.15, 4)
                 confidence = round(0.55 + normalized * 0.15, 4)
                 return self.make_signal(
