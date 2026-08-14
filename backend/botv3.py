@@ -892,61 +892,83 @@ class botV3:
             current += timedelta(days=1)
         return count
 
+    async def _close_short_market(self, qty: float, symbol: str, ledger: Any) -> None:
+        """Buy to cover a short position at market."""
+        try:
+            from backend.execution import place_market_buy
+            order_id, _ = await place_market_buy(symbol, qty)
+            if order_id:
+                close_entry(ledger, symbol=symbol, order_id=order_id, exit_price=None, reason="time_exit_cover", cooldown_minutes=self.cooldown_minutes)
+                _BOUGHT_THIS_SESSION.add(symbol)
+                logger.info("Short time exit cover: %s qty=%.0f", symbol, qty)
+        except Exception:
+            logger.exception("_close_short_market failed symbol=%s", symbol)  
+
+    async def _close_short_market(self, qty: float, symbol: str, ledger: Any) -> None:
+        """Buy to cover a short position at market."""
+        try:
+            from backend.execution import place_market_buy
+            order_id, _ = await place_market_buy(symbol, qty)
+            if order_id:
+                close_entry(ledger, symbol=symbol, order_id=order_id, exit_price=None, reason="time_exit_cover", cooldown_minutes=self.cooldown_minutes)
+                _BOUGHT_THIS_SESSION.add(symbol)
+                logger.info("Short time exit cover: %s qty=%.0f", symbol, qty)
+        except Exception:
+            logger.exception("_close_short_market failed symbol=%s", symbol)         
+
     async def _intraday_time_exit_pass(self, ledger: Any) -> None:
-        """Exit intraday positions after 5 trading days unless up >15%."""
+        """Exit positions after validated hold window unless above gain threshold."""
         try:
             positions = await _get_open_positions()
             pos_map = {p.get("symbol"): p for p in positions}
             now = datetime.now(ET)
-
             for symbol, entries in ledger.items():
                 if not isinstance(entries, list):
                     continue
-                # Find open intraday entry
                 open_entry = next(
                     (e for e in reversed(entries)
                      if e.get("status") == "open"
-                     and str(e.get("strategy", "")).lower() == "intraday"),
+                     and str(e.get("strategy", "")).lower() in ("intraday", "wave", "ares")),
                     None,
                 )
                 if not open_entry:
                     continue
-
-                # Check trading days held
                 created_at = _from_iso(open_entry.get("created_at"))
                 if not created_at:
                     continue
                 trading_days = self._count_trading_days(created_at, now)
-                if trading_days < 5:
+                strategy = str(open_entry.get("strategy", "")).lower()
+                hold_days = 21 if strategy == "ares" else 5
+                if trading_days < hold_days:
                     continue
-
-                # Check if position still open
                 pos = pos_map.get(symbol)
                 if not pos:
                     continue
-
                 qty = float(pos.get("qty", 0))
-                if qty <= 0:
+                if qty == 0:
                     continue
-
-                # Hybrid rule — skip exit if up >15%
+                if qty < 0:
+                    logger.info("Time exit (short cover): %s held %d trading days (hold_days=%d)", symbol, trading_days, hold_days)
+                    await self._close_short_market(abs(qty), symbol, ledger)
+                    continue
+                # Short position — buy to cover
+                if qty < 0:
+                    logger.info("Time exit (short cover): %s held %d trading days (hold_days=%d)", symbol, trading_days, hold_days)
+                    await self._close_short_market(abs(qty), symbol, ledger)
+                    continue
                 entry_price = float(open_entry.get("entry_price", 0) or 0)
                 current_price = float(pos.get("current_price", 0) or 0)
                 if entry_price > 0 and current_price > 0:
                     gain_pct = (current_price - entry_price) / entry_price
-                    if gain_pct > 0.15:
+                    threshold = 0.30 if strategy == "ares" else 0.15
+                    if gain_pct > threshold:
                         logger.info(
-                            "5-day exit skipped for %s — up %.1f%% (>15%% threshold), letting trailing stop run",
-                            symbol, gain_pct * 100,
+                            "Time exit skipped for %s — up %.1f%% (>%.0f%% threshold), letting trailing stop run",
+                            symbol, gain_pct * 100, threshold * 100,
                         )
                         continue
-
-                logger.info(
-                    "5-day time exit: %s held %d trading days, closing at market",
-                    symbol, trading_days,
-                )
-                await self._close_position_market(symbol, qty, "intraday_5day_exit", ledger)
-
+                logger.info("Time exit: %s held %d trading days (hold_days=%d)", symbol, trading_days, hold_days)
+                await self._close_position_market(symbol, qty, "intraday_time_exit", ledger)
         except Exception:
             logger.exception("_intraday_time_exit_pass failed")        
 
