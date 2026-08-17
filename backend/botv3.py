@@ -45,7 +45,7 @@ from backend.services.trade_ledger_service import (
     save_ledger,
     _from_iso,
 )
-
+from backend.agents.tradetiq_agent import TradetiqAgent
 
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -458,6 +458,11 @@ class botV3:
         if use_intraday:
             self.agents.append(IntradayAgent())
             logger.info("IntradayAgent enabled (Ripple/Ares/Wave/Surge)")
+
+        use_tradetiq = bool(getattr(config, "USE_TRADETIQ_AGENT", False))
+        if use_tradetiq:
+            self.agents.append(TradetiqAgent())
+            logger.info("TradetiqAgent enabled")    
 
     def _reset_cycle_cache(self) -> None:
         self._open_positions_cache = None
@@ -928,7 +933,7 @@ class botV3:
                 open_entry = next(
                     (e for e in reversed(entries)
                      if e.get("status") == "open"
-                     and str(e.get("strategy", "")).lower() in ("intraday", "wave", "ares")),
+                     and str(e.get("strategy", "")).lower() in ("intraday", "wave", "ares", "tradetiq")),
                     None,
                 )
                 if not open_entry:
@@ -944,7 +949,7 @@ class botV3:
                         continue
                 trading_days = self._count_trading_days(created_at, now)
                 strategy = str(open_entry.get("strategy", "")).lower()
-                hold_days = 21 if strategy == "ares" else 5
+                hold_days = 21 if strategy in ("ares", "tradetiq") else 5
                 if trading_days < hold_days:
                     continue
                 pos = pos_map.get(symbol)
@@ -957,7 +962,7 @@ class botV3:
                 current_price = float(pos.get("current_price", 0) or 0)
                 if entry_price > 0 and current_price > 0:
                     gain_pct = (current_price - entry_price) / entry_price
-                    threshold = 0.30 if strategy == "ares" else 0.15
+                    threshold = 0.30 if strategy in ("ares", "tradetiq") else 0.15
                     if gain_pct > threshold:
                         logger.info(
                             "Time exit skipped for %s -- up %.1f%% (>%.0f%% threshold), letting trailing stop run",

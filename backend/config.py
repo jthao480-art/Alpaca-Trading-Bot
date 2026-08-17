@@ -61,6 +61,9 @@ USE_SURGE = _env.get("USE_SURGE", "true").lower() == "true"
 LOSER_EXIT_THRESHOLD = float(_env.get("LOSER_EXIT_THRESHOLD", "-0.05"))
 DATA_DIR = _env.get("DATA_DIR", ".")
 USE_ARES_BEARISH = _env.get("USE_ARES_BEARISH", "false").lower() == "true"
+TRADETIQ_API_KEY = _env.get("TRADETIQ_API_KEY", "")
+TRADETIQ_BASE_URL = _env.get("TRADETIQ_BASE_URL", "https://tradetiq-production.up.railway.app")
+USE_TRADETIQ_AGENT = _env.get("USE_TRADETIQ_AGENT", "false").lower() == "true"
 
 @lru_cache(maxsize=1)
 def load_tradable_equities() -> list[str]:
