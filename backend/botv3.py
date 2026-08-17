@@ -940,7 +940,7 @@ class botV3:
                 open_entry = next(
                     (e for e in reversed(entries)
                      if e.get("status") == "open"
-                     and str(e.get("strategy", "")).lower() in ("intraday", "wave", "ares", "tradetiq")),
+                     and str(e.get("strategy", "")).lower() in ("intraday", "wave", "ares", "tradetiq", "smarttiq", "nexus")),
                     None,
                 )
                 if not open_entry:
