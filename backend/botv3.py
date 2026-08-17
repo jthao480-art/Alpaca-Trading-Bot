@@ -53,6 +53,8 @@ _PENDING_SELLS: set[str] = set()
 _PENDING_BUYS: set[str] = set()
 _BOUGHT_THIS_SESSION: set[str] = set()
 _LAST_LOSER_SWEEP: datetime | None = None
+_FAILED_SELL_ATTEMPTS: dict[str, int] = {}
+_MAX_SELL_ATTEMPTS: int = 3
 
 MAX_POSITIONS = int(getattr(config, "MAX_POSITIONS", 150))
 DAILY_LOSS_LIMIT = float(getattr(config, "DAILY_LOSS_LIMIT", -2000))
@@ -545,6 +547,9 @@ class botV3:
                 continue
             if symbol in _PENDING_SELLS:
                 continue
+            if _FAILED_SELL_ATTEMPTS.get(symbol, 0) >= _MAX_SELL_ATTEMPTS:
+                logger.debug("loser_sweep_skip symbol=%s reason=too_many_failed_attempts", symbol)
+                continue
 
             in_cooldown, cooldown_until = is_in_cooldown(ledger, symbol)
             if in_cooldown:
@@ -592,7 +597,12 @@ class botV3:
                     _BOUGHT_THIS_SESSION.add(symbol)
                     logger.info("loser_sweep_submitted symbol=%s order_id=%s qty=%.4f", symbol, order_id, qty)
                 else:
-                    logger.warning("loser_sweep_failed symbol=%s qty=%.4f reason=no_order_id", symbol, qty)
+                    _FAILED_SELL_ATTEMPTS[symbol] = _FAILED_SELL_ATTEMPTS.get(symbol, 0) + 1
+                    logger.warning("loser_sweep_failed symbol=%s qty=%.4f reason=no_order_id attempts=%d", symbol, qty, _FAILED_SELL_ATTEMPTS[symbol])
+                    if _FAILED_SELL_ATTEMPTS.get(symbol, 0) >= _MAX_SELL_ATTEMPTS:
+                        logger.warning("Blacklisting %s — too many failed sell attempts", symbol)
+                        BLACKLIST.add(symbol)
+                        _BOUGHT_THIS_SESSION.add(symbol)
             except Exception:
                 logger.exception("loser_sweep_exception symbol=%s qty=%.4f", symbol, qty)
             finally:
@@ -891,18 +901,6 @@ class botV3:
                 count += 1
             current += timedelta(days=1)
         return count
-
-    async def _close_short_market(self, qty: float, symbol: str, ledger: Any) -> None:
-        """Buy to cover a short position at market."""
-        try:
-            from backend.execution import place_market_buy
-            order_id, _ = await place_market_buy(symbol, qty)
-            if order_id:
-                close_entry(ledger, symbol=symbol, order_id=order_id, exit_price=None, reason="time_exit_cover", cooldown_minutes=self.cooldown_minutes)
-                _BOUGHT_THIS_SESSION.add(symbol)
-                logger.info("Short time exit cover: %s qty=%.0f", symbol, qty)
-        except Exception:
-            logger.exception("_close_short_market failed symbol=%s", symbol)  
 
     async def _close_short_market(self, qty: float, symbol: str, ledger: Any) -> None:
         """Buy to cover a short position at market."""
