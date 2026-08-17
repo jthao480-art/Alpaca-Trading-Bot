@@ -1,183 +1,236 @@
 from __future__ import annotations
 
 """
-tradetiq_agent.py — Tradetiq API signal agent.
+tradetiq_agent.py — Tradetiq curated signal agent.
 
-Calls Tradetiq's /api/composite/{symbol} endpoint to get composite
-signals including technical, smart money, social sentiment, and
-early signals (social spike, unusual volume, news velocity, insider cluster).
+Calls /api/signals/todays-signals-bot ONCE per day and caches the result.
+Each symbol in the curated list is returned as a buy signal when analyzed.
 
-Hold window: 21 days (matches Tradetiq's composite validation)
-Bullish-only by design — composite Bearish side not validated for bot use.
+Individual signal types can be toggled via .env / Railway Variables:
+    USE_TRADETIQ_RIPPLE=true/false       (Ripple provisional, 5-day hold)
+    USE_TRADETIQ_ARES=true/false         (Ares provisional, 21-day hold)
+    USE_TRADETIQ_WAVE=true/false         (Wave provisional, 5-day hold)
+    USE_TRADETIQ_SMARTTIQ=true/false     (SmartTiq EOD, 21-day hold)
+    USE_TRADETIQ_NEXUS=true/false        (Nexus EOD, 35-day hold)
 
-Configure via .env:
-    TRADETIQ_API_KEY=tdk_...
-    TRADETIQ_BASE_URL=https://tradetiq-production.up.railway.app
-    USE_TRADETIQ_AGENT=false
+Master switch:
+    USE_TRADETIQ_AGENT=true/false
+
+Hold windows (match Tradetiq validated research):
+    ripple_provisional  → 5 trading days
+    wave_provisional    → 5 trading days
+    ares_provisional    → 21 trading days
+    smarttiq            → 21 trading days
+    nexus               → 35 trading days
 """
 
 import asyncio
+import logging
+import time
+from datetime import datetime
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 
 from backend.agents.base import BaseAgent
 from backend import config
 
-# Thresholds
-_BULLISH_THRESHOLD = 65       # composite_score >= this → Bullish
-_MIN_TECHNICAL_SCORE = 60     # technical component score minimum
-_CACHE: dict[str, dict] = {}  # simple in-memory cache
-_CACHE_TTL_SECONDS = 300      # 5 minutes
+logger = logging.getLogger(__name__)
+ET = ZoneInfo("America/New_York")
+
+_HOLD_DAYS: dict[str, int] = {
+    "ripple_provisional": 5,
+    "wave_provisional": 5,
+    "ares_provisional": 21,
+    "smarttiq": 21,
+    "nexus": 35,
+}
+
+_GAIN_THRESHOLD: dict[str, float] = {
+    "ripple_provisional": 0.15,
+    "wave_provisional": 0.15,
+    "ares_provisional": 0.30,
+    "smarttiq": 0.30,
+    "nexus": 0.40,
+}
+
+_CACHE: dict[str, Any] = {
+    "date": None,
+    "data": None,
+    "symbol_map": {},
+    "ts": 0.0,
+}
+_CACHE_LOCK = asyncio.Lock()
+
+
+def _get_enabled_signal_types() -> set[str]:
+    enabled = set()
+    if getattr(config, "USE_TRADETIQ_RIPPLE", True):
+        enabled.add("ripple_provisional")
+    if getattr(config, "USE_TRADETIQ_ARES", True):
+        enabled.add("ares_provisional")
+    if getattr(config, "USE_TRADETIQ_WAVE", True):
+        enabled.add("wave_provisional")
+    if getattr(config, "USE_TRADETIQ_SMARTTIQ", False):
+        enabled.add("smarttiq")
+    if getattr(config, "USE_TRADETIQ_NEXUS", False):
+        enabled.add("nexus")
+    return enabled
+
+
+async def _fetch_todays_signals() -> dict | None:
+    api_key = getattr(config, "TRADETIQ_API_KEY", "")
+    base_url = getattr(config, "TRADETIQ_BASE_URL", "https://tradetiq-production.up.railway.app").rstrip("/")
+    if not api_key:
+        logger.warning("TRADETIQ_API_KEY not configured")
+        return None
+    headers = {
+        "X-API-Key": api_key,
+        "X-Device-Id": "alpaca-bot-01",
+        "X-Device-Name": "Alpaca Bot",
+    }
+    url = f"{base_url}/api/signals/todays-signals-bot"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                return resp.json()
+            elif resp.status_code == 429:
+                logger.warning("Tradetiq rate limited")
+                return None
+            elif resp.status_code == 403:
+                logger.warning("Tradetiq 403 — check API key tier")
+                return None
+            else:
+                logger.warning("Tradetiq returned %d", resp.status_code)
+                return None
+    except Exception:
+        logger.exception("Tradetiq fetch failed")
+        return None
+
+
+def _build_symbol_map(data: dict, enabled: set[str]) -> dict[str, list[dict]]:
+    symbol_map: dict[str, list[dict]] = {}
+    eod = data.get("eod", {}) or {}
+    provisional = data.get("provisional", {}) or {}
+
+    eod_map = {"ripple": "ripple", "wave": "wave", "smarttiq": "smarttiq", "ares": "ares", "nexus": "nexus"}
+    for api_key, signal_type in eod_map.items():
+        if signal_type not in enabled:
+            continue
+        for entry in eod.get(api_key, []) or []:
+            symbol = entry.get("symbol", "")
+            if not symbol:
+                continue
+            symbol_map.setdefault(symbol, []).append({
+                "signal_type": signal_type,
+                "quality_score": float(entry.get("quality_score", 0.5) or 0.5),
+                "risk_tag": str(entry.get("risk_tag", "Unknown")),
+                "label": str(entry.get("label", "Bullish")),
+            })
+
+    provisional_map = {
+        "ripple_provisional": "ripple_provisional",
+        "wave_provisional": "wave_provisional",
+        "ares_provisional": "ares_provisional",
+    }
+    for api_key, signal_type in provisional_map.items():
+        if signal_type not in enabled:
+            continue
+        for entry in provisional.get(api_key, []) or []:
+            symbol = entry.get("symbol", "")
+            if not symbol:
+                continue
+            symbol_map.setdefault(symbol, []).append({
+                "signal_type": signal_type,
+                "quality_score": float(entry.get("quality_score", 0.5) or 0.5),
+                "risk_tag": str(entry.get("risk_tag", "Unknown")),
+                "label": str(entry.get("label", "Bullish")),
+            })
+
+    return symbol_map
+
+
+async def _ensure_cache_fresh() -> None:
+    async with _CACHE_LOCK:
+        today = datetime.now(ET).strftime("%Y-%m-%d")
+        if _CACHE["date"] == today and _CACHE["data"] is not None:
+            return
+        logger.info("Fetching Tradetiq todays-signals-bot for %s", today)
+        data = await _fetch_todays_signals()
+        if data:
+            enabled = _get_enabled_signal_types()
+            _CACHE["date"] = today
+            _CACHE["data"] = data
+            _CACHE["symbol_map"] = _build_symbol_map(data, enabled)
+            _CACHE["ts"] = time.time()
+            total = sum(len(v) for v in _CACHE["symbol_map"].values())
+            logger.info(
+                "Tradetiq cache: %d symbols, %d signals, enabled=%s",
+                len(_CACHE["symbol_map"]), total, enabled,
+            )
+        else:
+            logger.warning("Tradetiq fetch failed — keeping stale cache")
 
 
 class TradetiqAgent(BaseAgent):
     name = "tradetiq"
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.api_key = getattr(config, "TRADETIQ_API_KEY", "")
-        self.base_url = getattr(config, "TRADETIQ_BASE_URL", "https://tradetiq-production.up.railway.app").rstrip("/")
-        self.headers = {
-            "X-API-Key": self.api_key,
-            "X-Device-Id": "alpaca-bot-01",
-            "X-Device-Name": "Alpaca Bot",
-        }
-
-    async def _fetch_composite(self, symbol: str) -> dict | None:
-        """Fetch composite signal from Tradetiq API with caching."""
-        import time
-        cache_key = symbol.upper()
-        cached = _CACHE.get(cache_key)
-        if cached and (time.time() - cached.get("_ts", 0)) < _CACHE_TTL_SECONDS:
-            return cached
-
-        url = f"{self.base_url}/api/composite/{symbol}"
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(url, headers=self.headers)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    data["_ts"] = time.time()
-                    _CACHE[cache_key] = data
-                    return data
-                elif resp.status_code == 429:
-                    self.logger.warning("Tradetiq rate limited for %s", symbol)
-                    return None
-                else:
-                    self.logger.debug("Tradetiq %s returned %d", symbol, resp.status_code)
-                    return None
-        except Exception:
-            self.logger.exception("Tradetiq API call failed for %s", symbol)
-            return None
-
     async def analyze(self, symbol: str) -> Optional[dict[str, Any]]:
         try:
-            if not self.api_key:
+            await _ensure_cache_fresh()
+            symbol_upper = symbol.upper()
+            signals = _CACHE["symbol_map"].get(symbol_upper, [])
+
+            if not signals:
                 return self.make_signal(
-                    symbol=symbol,
-                    score=0.5,
-                    direction="hold",
-                    confidence=0.0,
-                    reason="tradetiq: no API key configured",
+                    symbol=symbol, score=0.5, direction="hold", confidence=0.1,
+                    reason="tradetiq: not in today's curated list",
                     metadata={"tradetiq_active": False},
                 )
 
-            data = await self._fetch_composite(symbol)
-            if not data:
-                return self.make_signal(
-                    symbol=symbol,
-                    score=0.5,
-                    direction="hold",
-                    confidence=0.1,
-                    reason="tradetiq: no data available",
-                    metadata={"tradetiq_active": False},
-                )
+            best = max(signals, key=lambda x: x["quality_score"])
+            signal_type = best["signal_type"]
+            quality_score = best["quality_score"]
+            risk_tag = best["risk_tag"]
+            hold_days = _HOLD_DAYS.get(signal_type, 5)
 
-            composite_score = int(data.get("composite_score", 50) or 50)
-            composite_label = str(data.get("composite_label", "Neutral"))
-            components = data.get("components", {}) or {}
+            signal_score = round(0.65 + min(quality_score, 0.5) * 0.50, 4)
+            confidence = 0.65
+            if quality_score > 0.15:
+                confidence += 0.05
+            if "Low" in risk_tag:
+                confidence += 0.05
+            elif "Extreme" in risk_tag:
+                confidence -= 0.05
+            if len(signals) > 1:
+                confidence += 0.05
+            confidence = min(0.90, round(confidence, 4))
 
-            # Extract component scores
-            technical = components.get("technical", {}) or {}
-            smart_money = components.get("smart_money", {}) or {}
-            social = components.get("social_sentiment", {}) or {}
-            news = components.get("news_sentiment", {}) or {}
-            early = components.get("early_signal", {}) or {}
+            signal_names = [s["signal_type"] for s in signals]
 
-            tech_score = int(technical.get("signal_score", 50) or 50)
-            tech_label = str(technical.get("signal_label", "Neutral"))
-            sm_score = int(smart_money.get("score", 50) or 50)
-            sm_label = str(smart_money.get("label", "Neutral"))
-            social_label = str(social.get("sentiment_label", "Neutral"))
-            news_score = int(news.get("score", 50) or 50)
-            early_score = int(early.get("score", 50) or 50)
-            strong_signals = early.get("strong_signals", []) or []
-
-            metadata = {
-                "tradetiq_active": composite_label == "Bullish",
-                "composite_score": composite_score,
-                "composite_label": composite_label,
-                "technical_score": tech_score,
-                "technical_label": tech_label,
-                "smart_money_score": sm_score,
-                "smart_money_label": sm_label,
-                "social_label": social_label,
-                "news_score": news_score,
-                "early_score": early_score,
-                "strong_signals": strong_signals,
-            }
-
-            if composite_label == "Bullish" and composite_score >= _BULLISH_THRESHOLD:
-                # Scale signal score from composite (65-100 → 0.65-0.95)
-                normalized = (composite_score - _BULLISH_THRESHOLD) / (100 - _BULLISH_THRESHOLD)
-                signal_score = round(0.65 + normalized * 0.30, 4)
-
-                # Boost confidence if multiple components agree
-                confidence = 0.60
-                if tech_label == "Bullish":
-                    confidence += 0.08
-                if sm_label == "Bullish":
-                    confidence += 0.08
-                if strong_signals:
-                    confidence += 0.05
-                if social_label == "Bullish":
-                    confidence += 0.04
-                confidence = min(0.92, round(confidence, 4))
-
-                reason_parts = [f"Tradetiq composite={composite_score}"]
-                if tech_label == "Bullish":
-                    reason_parts.append(f"tech={tech_score}")
-                if sm_label == "Bullish":
-                    reason_parts.append("smart_money=Bullish")
-                if strong_signals:
-                    reason_parts.append(f"signals={','.join(strong_signals)}")
-
-                return self.make_signal(
-                    symbol=symbol,
-                    score=min(0.95, signal_score),
-                    direction="buy",
-                    confidence=confidence,
-                    reason=" | ".join(reason_parts),
-                    metadata=metadata,
-                )
-            else:
-                return self.make_signal(
-                    symbol=symbol,
-                    score=0.5,
-                    direction="hold",
-                    confidence=0.1,
-                    reason=f"Tradetiq: {composite_label} (score={composite_score})",
-                    metadata=metadata,
-                )
+            return self.make_signal(
+                symbol=symbol,
+                score=min(0.92, signal_score),
+                direction="buy",
+                confidence=confidence,
+                reason=f"Tradetiq: {', '.join(signal_names)} | quality={quality_score:.3f} | risk={risk_tag} | hold={hold_days}d",
+                metadata={
+                    "tradetiq_active": True,
+                    "signal_type": signal_type,
+                    "signal_types": signal_names,
+                    "quality_score": quality_score,
+                    "risk_tag": risk_tag,
+                    "hold_days": hold_days,
+                    "intraday_active": True,
+                },
+            )
 
         except Exception:
             self.logger.exception("TradetiqAgent failed for %s", symbol)
             return self.make_signal(
-                symbol=symbol,
-                score=0.5,
-                direction="hold",
-                confidence=0.0,
+                symbol=symbol, score=0.5, direction="hold", confidence=0.0,
                 reason="tradetiq_agent_error",
                 metadata={"tradetiq_active": False},
             )

@@ -64,6 +64,11 @@ USE_ARES_BEARISH = _env.get("USE_ARES_BEARISH", "false").lower() == "true"
 TRADETIQ_API_KEY = _env.get("TRADETIQ_API_KEY", "")
 TRADETIQ_BASE_URL = _env.get("TRADETIQ_BASE_URL", "https://tradetiq-production.up.railway.app")
 USE_TRADETIQ_AGENT = _env.get("USE_TRADETIQ_AGENT", "false").lower() == "true"
+USE_TRADETIQ_RIPPLE = _env.get("USE_TRADETIQ_RIPPLE", "true").lower() == "true"
+USE_TRADETIQ_ARES = _env.get("USE_TRADETIQ_ARES", "true").lower() == "true"
+USE_TRADETIQ_WAVE = _env.get("USE_TRADETIQ_WAVE", "true").lower() == "true"
+USE_TRADETIQ_SMARTTIQ = _env.get("USE_TRADETIQ_SMARTTIQ", "false").lower() == "true"
+USE_TRADETIQ_NEXUS = _env.get("USE_TRADETIQ_NEXUS", "false").lower() == "true"
 
 @lru_cache(maxsize=1)
 def load_tradable_equities() -> list[str]:

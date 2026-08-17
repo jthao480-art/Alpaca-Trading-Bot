@@ -949,7 +949,12 @@ class botV3:
                         continue
                 trading_days = self._count_trading_days(created_at, now)
                 strategy = str(open_entry.get("strategy", "")).lower()
-                hold_days = 21 if strategy in ("ares", "tradetiq") else 5
+                if strategy == "nexus":
+                    hold_days = 35
+                elif strategy in ("ares", "tradetiq", "smarttiq"):
+                    hold_days = 21
+                else:
+                    hold_days = 5
                 if trading_days < hold_days:
                     continue
                 pos = pos_map.get(symbol)
@@ -962,7 +967,12 @@ class botV3:
                 current_price = float(pos.get("current_price", 0) or 0)
                 if entry_price > 0 and current_price > 0:
                     gain_pct = (current_price - entry_price) / entry_price
-                    threshold = 0.30 if strategy in ("ares", "tradetiq") else 0.15
+                    if strategy == "nexus":
+                        threshold = 0.40
+                    elif strategy in ("ares", "tradetiq", "smarttiq"):
+                        threshold = 0.30
+                    else:
+                        threshold = 0.15
                     if gain_pct > threshold:
                         logger.info(
                             "Time exit skipped for %s -- up %.1f%% (>%.0f%% threshold), letting trailing stop run",
@@ -1163,7 +1173,8 @@ class botV3:
                 # Intraday agent signals bypass volume ratio gate — they have own volume logic
                 _is_intraday = str(signal.get("agent", "")).lower() == "intraday"
                 _intraday_active = bool(metadata.get("intraday_active", False))
-                if not _is_intraday and not (volume_ratio >= self.volume_ratio_entry or breakout or volume_acceleration >= 0.95):
+                _is_tradetiq = str(signal.get("agent", "")).lower() == "tradetiq"
+                if not _is_intraday and not _is_tradetiq and not (volume_ratio >= self.volume_ratio_entry or breakout or volume_acceleration >= 0.95):
                     continue
                 if not spy_trend_up and score < 0.72:
                     logger.debug("Skipping %s — SPY downtrend, score %.2f below 0.72 threshold", symbol, score)
