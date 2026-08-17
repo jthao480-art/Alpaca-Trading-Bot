@@ -422,7 +422,7 @@ class botV3:
         self._open_positions_cache: dict[str, float] | None = None
         self._bars_cache: dict[Any, Any] = {}
         self._news_cache: dict[Any, Any] = {}
-        self._last_loser_sweep: datetime | None = None
+        self._LAST_LOSER_SWEEP: datetime | None = None
         self._session_date: Any = None
 
         use_wave = bool(getattr(config, "USE_WAVE_AGENT", False))
@@ -555,6 +555,9 @@ class botV3:
             if _FAILED_SELL_ATTEMPTS.get(symbol, 0) >= _MAX_SELL_ATTEMPTS:
                 logger.debug("loser_sweep_skip symbol=%s reason=too_many_failed_attempts", symbol)
                 continue
+            if _FAILED_SELL_ATTEMPTS.get(symbol, 0) >= _MAX_SELL_ATTEMPTS:
+                logger.debug("loser_sweep_skip symbol=%s reason=too_many_failed_attempts", symbol)
+                continue
 
             in_cooldown, cooldown_until = is_in_cooldown(ledger, symbol)
             if in_cooldown:
@@ -603,7 +606,11 @@ class botV3:
                     logger.info("loser_sweep_submitted symbol=%s order_id=%s qty=%.4f", symbol, order_id, qty)
                 else:
                     _FAILED_SELL_ATTEMPTS[symbol] = _FAILED_SELL_ATTEMPTS.get(symbol, 0) + 1
-                    logger.warning("loser_sweep_failed symbol=%s qty=%.4f reason=no_order_id attempts=%d", symbol, qty, _FAILED_SELL_ATTEMPTS[symbol])
+                    logger.warning("loser_sweep_failed symbol=%s qty=%.4f attempts=%d", symbol, qty, _FAILED_SELL_ATTEMPTS[symbol])
+                    if _FAILED_SELL_ATTEMPTS.get(symbol, 0) >= _MAX_SELL_ATTEMPTS:
+                        logger.warning("Blacklisting %s — too many failed sell attempts", symbol)
+                        BLACKLIST.add(symbol)
+                        _BOUGHT_THIS_SESSION.add(symbol)
                     if _FAILED_SELL_ATTEMPTS.get(symbol, 0) >= _MAX_SELL_ATTEMPTS:
                         logger.warning("Blacklisting %s — too many failed sell attempts", symbol)
                         BLACKLIST.add(symbol)
