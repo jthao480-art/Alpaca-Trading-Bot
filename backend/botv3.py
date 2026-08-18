@@ -88,6 +88,7 @@ def _load_blacklist() -> set:
     base = {
         "POEL", "BEEP", "SAFX", "CBUS", "ALGS", "AMOD", "RXT",
         "TGEN", "SHMD", "ARBE", "RDCM", "OUST", "FDMT", "CTM", "CYPH",
+        "GLOB", "SSPC", "CXE",
     }
     if not _BLACKLIST_FILE.exists():
         return base
