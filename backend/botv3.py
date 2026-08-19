@@ -775,6 +775,14 @@ class botV3:
 
     async def _close_position_market(self, symbol: str, qty: float, reason: str, ledger: Any) -> None:
         try:
+            # Cancel any existing sell orders first (trailing stops etc)
+            if reason == "intraday_time_exit":
+                existing_orders = await _get_open_orders_for_symbol(symbol)
+                for o in existing_orders:
+                    if str(o.get("side", "")).lower() == "sell":
+                        await _cancel_order_by_id(str(o.get("id", "")))
+                        logger.info("Time exit: cancelled existing sell order for %s", symbol)
+                await asyncio.sleep(1.0)  # wait for cancellation to settle
             order_id = await place_market_sell(symbol, qty)
             if order_id:
                 close_entry(ledger, symbol=symbol, order_id=order_id, exit_price=None, reason=reason, cooldown_minutes=self.cooldown_minutes)
