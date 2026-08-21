@@ -250,6 +250,23 @@ def size_multiplier(momentum_score: float) -> float:
 
 
 def build_exit_plan(signal: dict[str, Any], bars_held: int = 0, green_gain_pct: float = 0.0) -> dict[str, float | bool]:
+    agent = str(signal.get("agent", "")).lower()
+    metadata = signal.get("metadata", {}) or {}
+    signal_type = str(metadata.get("signal_type", "")).lower()
+
+    # Long-hold signals — no trailing stop, hold to validated day
+    is_long_hold = (
+        agent == "tradetiq" and signal_type in ("smarttiq", "nexus")
+    )
+
+    if is_long_hold:
+        return {
+            "take_profit_pct": 0.40,
+            "stop_loss_pct": 0.08,
+            "use_trailing": False,
+            "trailing_stop_pct": 0.0,
+        }
+
     momentum_score = compute_momentum_score(signal)
     if momentum_score < 0.35:
         tp, sl = 0.008, 0.005
