@@ -69,6 +69,7 @@ USE_TRADETIQ_ARES = _env.get("USE_TRADETIQ_ARES", "true").lower() == "true"
 USE_TRADETIQ_WAVE = _env.get("USE_TRADETIQ_WAVE", "true").lower() == "true"
 USE_TRADETIQ_SMARTTIQ = _env.get("USE_TRADETIQ_SMARTTIQ", "false").lower() == "true"
 USE_TRADETIQ_NEXUS = _env.get("USE_TRADETIQ_NEXUS", "false").lower() == "true"
+DISCORD_WEBHOOK_URL = _env.get("DISCORD_WEBHOOK_URL", "")
 
 @lru_cache(maxsize=1)
 def load_tradable_equities() -> list[str]:

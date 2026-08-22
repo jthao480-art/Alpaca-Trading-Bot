@@ -20,6 +20,8 @@ from backend.execution import (
     attach_deferred_trailing_stops,
     _is_regular_market_hours,
 )
+from backend.health_check import health_monitor_loop
+asyncio.create_task(health_monitor_loop())
 
 load_dotenv(override=True)
 
@@ -235,6 +237,8 @@ async def main() -> None:
     # Start the hard-stop safety monitor as a background task —
     # runs continuously alongside the main bot loop, checks every 30 s
     asyncio.create_task(monitor_hard_stops())
+    from backend.health_check import health_monitor_loop
+    asyncio.create_task(health_monitor_loop())
     asyncio.create_task(monitor_position_protection(interval_seconds=7200))
 
     # Run one immediate protection sweep at startup

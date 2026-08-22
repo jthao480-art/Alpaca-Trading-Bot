@@ -1356,6 +1356,10 @@ class botV3:
                     },
                 )
                 logger.info("Long entry: %s qty=%d price=%.2f score=%.3f", symbol, qty, fill_price or price, score)
+                from backend.health_check import record_buy
+                record_buy()
+                from backend.health_check import record_buy
+                record_buy()
 
         # Process short candidates — only during entry hours
         for item in short_candidates:
@@ -1448,6 +1452,10 @@ class botV3:
             self._session_date = _now.date()
             _BOUGHT_THIS_SESSION.clear()
             logger.info("New trading day — cleared bought-this-session cache")
+            from backend.health_check import reset_daily_counts
+            reset_daily_counts()
+            from backend.health_check import reset_daily_counts
+            reset_daily_counts()
 
         all_signals: list[dict[str, Any]] = []
         errors = 0
