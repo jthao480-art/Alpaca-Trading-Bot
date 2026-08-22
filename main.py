@@ -20,8 +20,6 @@ from backend.execution import (
     attach_deferred_trailing_stops,
     _is_regular_market_hours,
 )
-from backend.health_check import health_monitor_loop
-asyncio.create_task(health_monitor_loop())
 
 load_dotenv(override=True)
 
