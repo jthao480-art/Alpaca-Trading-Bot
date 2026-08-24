@@ -1,2 +1,5 @@
 [phases.setup]
 nixPkgs = ["python312", "gcc", "stdenv.cc.cc.lib"]
+
+[variables]
+LD_LIBRARY_PATH = "/nix/store/ybjcla5bhj8g1y84998pn4a2drfxybkv-gcc-13.3.0-lib/lib"
