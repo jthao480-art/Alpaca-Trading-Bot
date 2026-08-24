@@ -156,7 +156,9 @@ async def run_health_checks() -> None:
 
 async def health_monitor_loop() -> None:
     """Background loop — runs every 30 minutes."""
-    await asyncio.sleep(60)  # wait 1 min after startup
+    await asyncio.sleep(10)  # check symbol universe quickly at startup
+    await check_symbol_universe()  # immediate startup check
+    await asyncio.sleep(50)  # wait rest of first minute
     while True:
         try:
             await run_health_checks()
