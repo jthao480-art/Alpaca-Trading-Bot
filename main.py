@@ -256,7 +256,8 @@ async def main() -> None:
     except Exception:
         logger.exception("sync_ledger_with_broker failed")
 
-    symbols = list(getattr(config, "SYMBOL_UNIVERSE", ["AAPL", "MSFT", "NVDA", "AMZN", "TSLA"]))
+    symbols = list(getattr(config, "SYMBOLS", ["AAPL", "MSFT", "NVDA", "AMZN", "TSLA"]))
+    logger.info("Symbol universe loaded: %d symbols", len(symbols))
     _last_deferred_check: str = ""   # track which regular session we last ran the deferred check
 
     while True:
