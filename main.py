@@ -258,6 +258,14 @@ async def main() -> None:
 
     symbols = list(getattr(config, "SYMBOLS", ["AAPL", "MSFT", "NVDA", "AMZN", "TSLA"]))
     logger.info("Symbol universe loaded: %d symbols", len(symbols))
+    if len(symbols) < 100:
+        logger.warning("Symbol universe too small (%d) — retrying load", len(symbols))
+        from backend.config import load_tradable_equities
+        load_tradable_equities.cache_clear()
+        symbols = load_tradable_equities()
+        logger.info("Symbol universe reloaded: %d symbols", len(symbols))
+        if len(symbols) < 100:
+            logger.critical("Symbol universe still too small (%d) — check LD_LIBRARY_PATH", len(symbols))
     _last_deferred_check: str = ""   # track which regular session we last ran the deferred check
 
     while True:
