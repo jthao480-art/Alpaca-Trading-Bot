@@ -1308,10 +1308,10 @@ class botV3:
             price = await get_latest_price(symbol)
             if not price:
                 continue
-            if price < 4.0:
-                logger.debug("Skipping %s — price %.2f below $4.00 minimum", symbol, price)
+            min_price = float(getattr(config, "MIN_PRICE", 4.0))
+            if price < min_price:
+                logger.debug("Skipping %s — price %.2f below $%.2f minimum", symbol, price, min_price)
                 continue
-
             buying_power = float(get_account_buying_power() or 0.0)
             if buying_power <= 0:
                 continue
