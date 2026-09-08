@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 from typing import Any, Optional
 
 from backend.agents.base import BaseAgent
-from backend.services.bars_service import get_bars
+from backend.services.bars_service import get_bars_cached as get_bars
 
 ET = ZoneInfo("America/New_York")
 

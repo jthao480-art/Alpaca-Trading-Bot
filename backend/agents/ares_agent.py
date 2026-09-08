@@ -22,7 +22,7 @@ from typing import Any, Optional
 import numpy as np
 
 from backend.agents.base import BaseAgent
-from backend.services.bars_service import get_bars
+from backend.services.bars_service import get_bars_cached as get_bars
 
 # -------------------------------------------------------------------
 # Score tables — ported directly from Tradetiq 5.0 early_signals.py

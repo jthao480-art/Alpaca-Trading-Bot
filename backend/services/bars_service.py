@@ -125,3 +125,20 @@ async def get_latest_trade(*args, **kwargs):
 
 async def get_recent_bars(symbol, timeframe="5Min", limit=60, feed="iex"):
     return await get_bars(symbol, timeframe=timeframe, limit=limit, feed=feed)
+
+    # Module-level cycle cache — cleared at start of each scan cycle
+_bars_cache: dict[str, list[dict]] = {}
+
+async def get_bars_cached(symbol: str, timeframe: str, limit: int) -> list[dict]:
+    """Fetch bars with cycle-level caching — reuses data across agents."""
+    # Use max limit as cache key — agents with smaller limits get subset
+    key = f"{symbol}_{timeframe}"
+    if key in _bars_cache:
+        bars = _bars_cache[key]
+        return bars[-limit:] if limit < len(bars) else bars
+    bars = await get_bars(symbol, timeframe=timeframe, limit=max(35, limit))
+    _bars_cache[key] = bars
+    return bars[-limit:] if limit < len(bars) else bars
+
+def clear_bars_cache() -> None:
+    _bars_cache.clear()

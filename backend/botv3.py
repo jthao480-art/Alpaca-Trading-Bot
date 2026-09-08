@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import asyncio
 import json
 import logging
@@ -8,10 +7,8 @@ from collections.abc import Iterable
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Optional
-
 from alpaca.trading.enums import AssetClass, AssetStatus
 from alpaca.trading.requests import GetAssetsRequest
-
 from backend import config
 from backend.agents.news_agent import NewsAgent
 from backend.agents.momentum_agent import MomentumAgent
@@ -49,6 +46,7 @@ from backend.agents.tradetiq_agent import TradetiqAgent
 
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
+
 _PENDING_SELLS: set[str] = set()
 _PENDING_BUYS: set[str] = set()
 _BOUGHT_THIS_SESSION: set[str] = set()
@@ -63,7 +61,6 @@ HARD_STOP_PCT = float(getattr(config, "HARD_STOP_PCT", 0.94))
 TRAIL_PCT = float(getattr(config, "TRAIL_PCT", 4.0))
 LOSER_EXIT_THRESHOLD = float(getattr(config, "LOSER_EXIT_THRESHOLD", -0.05))
 HALT_ENTRIES = False
-
 _DATA_DIR = pathlib.Path(getattr(config, "DATA_DIR", "."))
 _BLACKLIST_FILE = _DATA_DIR / "blacklist.json"
 _BLACKLIST_TTL_DAYS = 15
@@ -88,7 +85,7 @@ def _load_blacklist() -> set:
     base = {
         "POEL", "BEEP", "SAFX", "CBUS", "ALGS", "AMOD", "RXT",
         "TGEN", "SHMD", "ARBE", "RDCM", "OUST", "FDMT", "CTM", "CYPH",
-        "GLOB", "SSPC", "CXE","HWM","DCTH"
+        "GLOB", "SSPC", "CXE", "HWM", "DCTH",
     }
     if not _BLACKLIST_FILE.exists():
         return base
@@ -119,6 +116,7 @@ def _save_blacklist() -> None:
     base = {
         "POEL", "BEEP", "SAFX", "CBUS", "ALGS", "AMOD", "RXT",
         "TGEN", "SHMD", "ARBE", "RDCM", "OUST", "FDMT", "CTM", "CYPH",
+        "GLOB", "SSPC", "CXE", "HWM", "DCTH",
     }
     try:
         existing = {}
@@ -253,12 +251,10 @@ def build_exit_plan(signal: dict[str, Any], bars_held: int = 0, green_gain_pct: 
     agent = str(signal.get("agent", "")).lower()
     metadata = signal.get("metadata", {}) or {}
     signal_type = str(metadata.get("signal_type", "")).lower()
-
     # Long-hold signals — no trailing stop, hold to validated day
     is_long_hold = (
         agent == "tradetiq" and signal_type in ("smarttiq", "nexus")
     )
-
     if is_long_hold:
         return {
             "take_profit_pct": 0.40,
@@ -266,7 +262,6 @@ def build_exit_plan(signal: dict[str, Any], bars_held: int = 0, green_gain_pct: 
             "use_trailing": False,
             "trailing_stop_pct": 0.0,
         }
-
     momentum_score = compute_momentum_score(signal)
     if momentum_score < 0.35:
         tp, sl = 0.008, 0.005
@@ -424,7 +419,6 @@ class botV3:
         self.volume_ratio_entry = max(0.0, float(volume_ratio_entry))
         self.volume_ratio_exit = max(0.0, float(volume_ratio_exit))
         self.agents: list[Any] = []
-
         self.exit_tighten_after_bars = _cfg_int("EXIT_TIGHTEN_AFTER_BARS", 3)
         self.tight_loss_stop_pct = _cfg_float("TIGHT_LOSS_STOP_PCT", 0.004)
         self.trailing_trigger_pct = _cfg_float("TRAILING_TRIGGER_PCT", 0.008)
@@ -445,7 +439,6 @@ class botV3:
 
         use_wave = bool(getattr(config, "USE_WAVE_AGENT", False))
         use_default = bool(getattr(config, "USE_DEFAULT_AGENTS", True))
-
         if use_default:
             if self.use_news:
                 self.agents.append(NewsAgent())
@@ -462,27 +455,25 @@ class botV3:
             if self.use_insider:
                 self.agents.append(InsiderAgent())
             self.agents.append(SocialAgent())
-
         if use_wave:
             self.agents.append(WaveAgent())
             logger.info("WaveAgent enabled")
-
         use_ares = bool(getattr(config, "USE_ARES_AGENT", False))
         if use_ares:
             self.agents.append(AresAgent())
-            logger.info("AresAgent enabled")    
-
+            logger.info("AresAgent enabled")
         use_intraday = bool(getattr(config, "USE_INTRADAY_AGENT", False))
         if use_intraday:
             self.agents.append(IntradayAgent())
             logger.info("IntradayAgent enabled (Ripple/Ares/Wave/Surge)")
-
         use_tradetiq = bool(getattr(config, "USE_TRADETIQ_AGENT", False))
         if use_tradetiq:
             self.agents.append(TradetiqAgent())
-            logger.info("TradetiqAgent enabled")    
+            logger.info("TradetiqAgent enabled")
 
     def _reset_cycle_cache(self) -> None:
+        from backend.services.bars_service import clear_bars_cache
+        clear_bars_cache()
         self._open_positions_cache = None
         self._bars_cache = {}
         self._news_cache = {}
@@ -543,12 +534,10 @@ class botV3:
                 logger.debug("loser_sweep: skipping — ran %.0fs ago", elapsed)
                 return
         _LAST_LOSER_SWEEP = _now
-
         positions = self._load_position_objects()
         if not positions:
             logger.debug("loser_sweep: no open positions")
             return
-
         candidates: list[tuple[float, Any]] = []
         for p in positions:
             symbol = getattr(p, "symbol", "")
@@ -559,13 +548,10 @@ class botV3:
             if plpc is None:
                 continue
             candidates.append((plpc, p))
-
         candidates.sort(key=lambda x: x[0])
-
         for plpc, p in candidates:
             symbol = getattr(p, "symbol", "")
             qty = float(getattr(p, "qty", 0) or 0)
-
             if plpc > LOSER_EXIT_THRESHOLD:
                 continue
             if symbol in _PENDING_SELLS:
@@ -573,14 +559,9 @@ class botV3:
             if _FAILED_SELL_ATTEMPTS.get(symbol, 0) >= _MAX_SELL_ATTEMPTS:
                 logger.debug("loser_sweep_skip symbol=%s reason=too_many_failed_attempts", symbol)
                 continue
-            if _FAILED_SELL_ATTEMPTS.get(symbol, 0) >= _MAX_SELL_ATTEMPTS:
-                logger.debug("loser_sweep_skip symbol=%s reason=too_many_failed_attempts", symbol)
-                continue
-
             in_cooldown, cooldown_until = is_in_cooldown(ledger, symbol)
             if in_cooldown:
                 continue
-
             # Skip if trailing stop or bracket already protecting this position
             existing_orders = await _get_open_orders_for_symbol(symbol)
             active_exits = [
@@ -595,7 +576,6 @@ class botV3:
                     symbol, active_exits[0].get("type"),
                 )
                 continue
-
             _PENDING_SELLS.add(symbol)
             try:
                 logger.info(
@@ -625,10 +605,6 @@ class botV3:
                 else:
                     _FAILED_SELL_ATTEMPTS[symbol] = _FAILED_SELL_ATTEMPTS.get(symbol, 0) + 1
                     logger.warning("loser_sweep_failed symbol=%s qty=%.4f attempts=%d", symbol, qty, _FAILED_SELL_ATTEMPTS[symbol])
-                    if _FAILED_SELL_ATTEMPTS.get(symbol, 0) >= _MAX_SELL_ATTEMPTS:
-                        logger.warning("Blacklisting %s — too many failed sell attempts", symbol)
-                        BLACKLIST.add(symbol)
-                        _BOUGHT_THIS_SESSION.add(symbol)
                     if _FAILED_SELL_ATTEMPTS.get(symbol, 0) >= _MAX_SELL_ATTEMPTS:
                         logger.warning("Blacklisting %s — too many failed sell attempts", symbol)
                         BLACKLIST.add(symbol)
@@ -799,7 +775,7 @@ class botV3:
                     if str(o.get("side", "")).lower() == "sell":
                         await _cancel_order_by_id(str(o.get("id", "")))
                         logger.info("Time exit: cancelled existing sell order for %s", symbol)
-                await asyncio.sleep(1.0)  # wait for cancellation to settle
+                await asyncio.sleep(1.0)
             order_id = await place_market_sell(symbol, qty)
             if order_id:
                 close_entry(ledger, symbol=symbol, order_id=order_id, exit_price=None, reason=reason, cooldown_minutes=self.cooldown_minutes)
@@ -860,7 +836,6 @@ class botV3:
                 orders = await _get_open_orders_for_symbol(symbol)
                 order_types = [str(o.get("type", "")).lower() for o in orders]
                 order_sides = [str(o.get("side", "")).lower() for o in orders]
-
                 if qty > 0:
                     has_trailing = any(
                         t == "trailing_stop"
@@ -921,7 +896,6 @@ class botV3:
                                     logger.warning("Long %s — hard stop fallback placed at %.2f", symbol, stop_price)
                             else:
                                 logger.warning("Long %s — trailing stop failed, hard stop still active", symbol)
-
                 elif qty < 0:
                     has_trailing = any(
                         t == "trailing_stop"
@@ -968,7 +942,7 @@ class botV3:
         current = start.date()
         end_date = end.date()
         while current < end_date:
-            if current.weekday() < 5:  # Monday-Friday
+            if current.weekday() < 5:
                 count += 1
             current += timedelta(days=1)
         return count
@@ -983,7 +957,7 @@ class botV3:
                 _BOUGHT_THIS_SESSION.add(symbol)
                 logger.info("Short time exit cover: %s qty=%.0f", symbol, qty)
         except Exception:
-            logger.exception("_close_short_market failed symbol=%s", symbol)         
+            logger.exception("_close_short_market failed symbol=%s", symbol)
 
     async def _intraday_time_exit_pass(self, ledger: Any) -> None:
         """Exit positions after validated hold window unless above gain threshold."""
@@ -991,7 +965,6 @@ class botV3:
             positions = await _get_open_positions()
             pos_map = {p.get("symbol"): p for p in positions}
             now = datetime.now(ET)
-
             # First pass — ledger-tracked positions
             for symbol, entries in ledger.items():
                 if not isinstance(entries, list):
@@ -1050,7 +1023,6 @@ class botV3:
                     await self._close_short_market(abs(qty), symbol, ledger)
                 else:
                     await self._close_position_market(symbol, qty, "intraday_time_exit", ledger)
-
             # Second pass — positions not in ledger, use Alpaca opened_at
             ledger_symbols = set(ledger.keys())
             for p in positions:
@@ -1084,21 +1056,17 @@ class botV3:
                     await self._close_short_market(abs(qty), symbol, ledger)
                 else:
                     await self._close_position_market(symbol, qty, "intraday_time_exit", ledger)
-
         except Exception:
-            logger.exception("_intraday_time_exit_pass failed")      
+            logger.exception("_intraday_time_exit_pass failed")
 
     async def _handle_signals(self, signals: list[dict[str, Any]]) -> None:
         global HALT_ENTRIES
         ledger = load_ledger()
         open_positions = self._load_open_positions()
-
-        # Check if we're within entry hours (9:30 AM - 3:30 PM ET)
         _now_et = datetime.now(ET)
         _market_open = _now_et.replace(hour=9, minute=30, second=0, microsecond=0)
         _entry_cutoff = _now_et.replace(hour=16, minute=0, second=0, microsecond=0)
         _allow_new_entries = _market_open <= _now_et <= _entry_cutoff
-
         # Fetch SPY trend once per cycle
         spy_trend_up = True
         try:
@@ -1113,33 +1081,26 @@ class botV3:
                 )
         except Exception:
             logger.debug("SPY trend fetch failed — defaulting to uptrend")
-
         logger.debug("handle_signals_start signals=%d open_positions=%d", len(signals), len(open_positions))
         await self._liquidate_loser_sweep(ledger)
         await self._intraday_time_exit_pass(ledger)
         await self._session_exit_pass(ledger)
         await self._end_of_day_sweep(ledger)
-
         if not under_position_limit(self.trading_client):
             logger.debug("handle_signals_stop reason=position_limit")
             save_ledger(ledger)
             return
-
         if HALT_ENTRIES:
             logger.info("Entries halted — daily loss limit reached")
             save_ledger(ledger)
             return
-
         if not await self._market_allows_longs():
             logger.debug("handle_signals_stop reason=market_filter")
             save_ledger(ledger)
             return
-
         self.order_size_multiplier = self._vix_session_multiplier()
-
         candidates: list[dict[str, Any]] = []
         short_candidates: list[dict[str, Any]] = []
-
         # Build per-symbol volume data lookup from volume agent signals
         symbol_volume_data: dict[str, dict] = {}
         for signal in signals:
@@ -1154,14 +1115,12 @@ class botV3:
                         "average_volume": float(meta.get("average_volume", 1.0) or 1.0),
                         "breakout": bool(meta.get("breakout", False)),
                     }
-
         for signal in signals:
             symbol = signal.get("symbol")
             direction = str(signal.get("direction", "hold"))
             score = float(signal.get("score", 0.5) or 0.5)
             confidence = self._effective_signal_confidence(signal)
             metadata = signal.get("metadata", {}) or {}
-
             if not symbol:
                 continue
             if symbol in BLACKLIST:
@@ -1175,21 +1134,17 @@ class botV3:
             if symbol in _BOUGHT_THIS_SESSION:
                 logger.info("Skipping %s — already bought this session", symbol)
                 continue
-
             _vol_data = symbol_volume_data.get(symbol, {})
             volume_ratio = float(_vol_data.get("volume_ratio") or metadata.get("volume_ratio", 0.0) or 0.0)
             volume_acceleration = float(_vol_data.get("volume_acceleration") or metadata.get("volume_acceleration", 0.0) or 0.0)
             volume_slope = float(_vol_data.get("volume_slope") or metadata.get("volume_slope", 0.0) or 0.0)
             breakout = bool(_vol_data.get("breakout") or metadata.get("breakout", False))
-
             in_cooldown, _ = is_in_cooldown(ledger, symbol)
             if in_cooldown:
                 continue
-
             open_qty = 0.0
             if symbol in open_positions:
                 open_qty = float(open_positions.get(symbol, 0.0) or 0.0)
-
             if open_qty > 0:
                 exit_reason = None
                 _is_intraday = str(signal.get("agent", "")).lower() == "intraday"
@@ -1199,7 +1154,6 @@ class botV3:
                     exit_reason = "volume_ratio_fade"
                 elif direction == "sell" and confidence >= 0.5:
                     exit_reason = "sell_signal"
-
                 if exit_reason and symbol not in _PENDING_SELLS:
                     existing_orders = await _get_open_orders_for_symbol(symbol)
                     active_exits = [
@@ -1214,7 +1168,6 @@ class botV3:
                             symbol, active_exits[0].get("type"),
                         )
                         continue
-
                     _PENDING_SELLS.add(symbol)
                     try:
                         order_id = await place_market_sell(symbol, open_qty)
@@ -1230,13 +1183,11 @@ class botV3:
                     finally:
                         _PENDING_SELLS.discard(symbol)
                 continue
-
             if direction == "buy":
                 if score < max(0.62, self.early_entry_threshold):
                     continue
                 if confidence < 0.25:
                     continue
-                # Intraday agent signals bypass volume ratio gate — they have own volume logic
                 _is_intraday = str(signal.get("agent", "")).lower() == "intraday"
                 _intraday_active = bool(metadata.get("intraday_active", False))
                 _is_tradetiq = str(signal.get("agent", "")).lower() == "tradetiq"
@@ -1252,7 +1203,6 @@ class botV3:
                     "confidence": confidence,
                     "priority": trade_priority(signal),
                 })
-
             elif direction == "sell" and open_qty == 0:
                 if score < 0.75:
                     continue
@@ -1264,7 +1214,6 @@ class botV3:
                 if symbol in _BOUGHT_THIS_SESSION:
                     logger.debug("Skipping short %s — already traded this session", symbol)
                     continue
-                # Cap total short positions at 10
                 current_shorts = sum(
                     1 for v in open_positions.values()
                     if float(v) < 0
@@ -1292,19 +1241,16 @@ class botV3:
 
         # Process long candidates — only during entry hours
         for item in candidates:
-            # Re-check time on every order — scan may have started before cutoff
             _now_check = datetime.now(ET)
             _allow_new_entries = _now_check.replace(hour=9, minute=30) <= _now_check <= _now_check.replace(hour=16, minute=0)
             if not _allow_new_entries:
                 logger.info("Skipping remaining buys — passed 4:00 PM ET cutoff")
                 break
-
             signal = item["signal"]
             symbol = item["symbol"]
             score = float(item["score"])
             confidence = float(item["confidence"])
             metadata = signal.get("metadata", {}) or {}
-
             price = await get_latest_price(symbol)
             if not price:
                 continue
@@ -1313,9 +1259,10 @@ class botV3:
                 logger.debug("Skipping %s — price %.2f below $%.2f minimum", symbol, price, min_price)
                 continue
             buying_power = float(get_account_buying_power() or 0.0)
+            min_cash_reserve = float(getattr(config, "MIN_CASH_RESERVE", 0.0))
+            buying_power = max(0.0, buying_power - min_cash_reserve)
             if buying_power <= 0:
                 continue
-
             max_position_usd = _cfg_any_float("MAX_POSITION_SIZE_USD", "MAX_POSITION_SIZE", default=10000.0)
             position_pct = _cfg_float("POSITION_SIZE_PCT", 0.10)
             buy_power_cap = float(getattr(self, "buy_power_cap", 1.0) or 1.0)
@@ -1330,9 +1277,7 @@ class botV3:
             qty = int(allowed_dollars // float(price))
             if qty < 1:
                 continue
-
             exit_plan = build_exit_plan(signal)
-
             _PENDING_BUYS.add(symbol)
             _BOUGHT_THIS_SESSION.add(symbol)
             try:
@@ -1346,7 +1291,6 @@ class botV3:
                 )
             finally:
                 _PENDING_BUYS.discard(symbol)
-
             if order_id:
                 add_entry(
                     ledger,
@@ -1397,13 +1341,11 @@ class botV3:
             if not _allow_new_entries:
                 logger.debug("Skipping all shorts — outside entry hours (after 3:30 PM ET)")
                 break
-
             signal = item["signal"]
             symbol = item["symbol"]
             score = float(item["score"])
             confidence = float(item["confidence"])
             metadata = signal.get("metadata", {}) or {}
-
             price = await get_latest_price(symbol)
             if not price:
                 continue
@@ -1415,11 +1357,11 @@ class botV3:
                 continue
             if symbol in _PENDING_BUYS or symbol in _BOUGHT_THIS_SESSION:
                 continue
-
             buying_power = float(get_account_buying_power() or 0.0)
+            min_cash_reserve = float(getattr(config, "MIN_CASH_RESERVE", 0.0))
+            buying_power = max(0.0, buying_power - min_cash_reserve)
             if buying_power <= 0:
                 continue
-
             max_position_usd = _cfg_any_float("MAX_POSITION_SIZE_USD", "MAX_POSITION_SIZE", default=10000.0)
             position_pct = _cfg_float("POSITION_SIZE_PCT", 0.10)
             buy_power_cap = float(getattr(self, "buy_power_cap", 1.0) or 1.0)
@@ -1434,7 +1376,6 @@ class botV3:
             qty = int(allowed_dollars // float(price))
             if qty < 1:
                 continue
-
             _PENDING_BUYS.add(symbol)
             _BOUGHT_THIS_SESSION.add(symbol)
             try:
@@ -1448,7 +1389,6 @@ class botV3:
                 )
             finally:
                 _PENDING_BUYS.discard(symbol)
-
             if order_id:
                 add_entry(
                     ledger,
@@ -1470,14 +1410,11 @@ class botV3:
                     },
                 )
                 logger.info("Short entry: %s qty=%d price=%.2f score=%.3f", symbol, qty, fill_price or price, score)
-
         save_ledger(ledger)
 
     async def run_once(self, paper_only: bool = True) -> dict[str, Any]:
         self._reset_cycle_cache()
         self._open_positions_cache = None
-
-        # Only clear bought-this-session once per trading day
         _now = datetime.now(ET)
         if self._session_date is None or self._session_date != _now.date():
             self._session_date = _now.date()
@@ -1485,16 +1422,12 @@ class botV3:
             logger.info("New trading day — cleared bought-this-session cache")
             from backend.health_check import reset_daily_counts
             reset_daily_counts()
-            
-
         all_signals: list[dict[str, Any]] = []
         errors = 0
         symbols = list(self.symbols)
-
         import random
         random.shuffle(symbols)
         symbols = symbols[:500]
-
         for i in range(0, len(symbols), self.batch_size):
             batch = symbols[i: i + self.batch_size]
             try:
@@ -1505,16 +1438,12 @@ class botV3:
             except Exception:
                 errors += 1
                 logger.exception("batch_failed start=%s size=%s", i, len(batch))
-            # Protect positions every 20 batches
             if i > 0 and (i // self.batch_size) % 20 == 0:
                 await self._protect_positions()
-
-        # Only process signals if within entry hours
         _now_et = datetime.now(ET)
         _market_open = _now_et.replace(hour=9, minute=30, second=0, microsecond=0)
         _entry_cutoff = _now_et.replace(hour=16, minute=0, second=0, microsecond=0)
         _within_hours = _market_open <= _now_et <= _entry_cutoff
-
         if all_signals and _within_hours:
             try:
                 await self._handle_signals(all_signals)
@@ -1524,10 +1453,7 @@ class botV3:
                 logger.exception("handle_signals_failed")
         elif all_signals and not _within_hours:
             logger.info("Skipping signal processing — outside market hours (%s ET)", _now_et.strftime("%H:%M"))
-
-        # Final protection check after each full scan cycle
         await self._protect_positions()
-
         return {
             "paper_only": paper_only,
             "signals": all_signals,

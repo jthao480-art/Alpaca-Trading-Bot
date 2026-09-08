@@ -23,7 +23,7 @@ from typing import Any, Optional
 import numpy as np
 
 from backend.agents.base import BaseAgent
-from backend.services.bars_service import get_bars
+from backend.services.bars_service import get_bars_cached as get_bars
 
 # Wave parameters (validated 2026-07-24)
 _STREAK_MIN = 3
