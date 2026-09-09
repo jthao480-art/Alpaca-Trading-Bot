@@ -131,12 +131,15 @@ _bars_cache: dict[str, list[dict]] = {}
 
 async def get_bars_cached(symbol: str, timeframe: str, limit: int) -> list[dict]:
     """Fetch bars with cycle-level caching — reuses data across agents."""
-    # Use max limit as cache key — agents with smaller limits get subset
     key = f"{symbol}_{timeframe}"
     if key in _bars_cache:
         bars = _bars_cache[key]
+        if not bars:
+            return []
         return bars[-limit:] if limit < len(bars) else bars
     bars = await get_bars(symbol, timeframe=timeframe, limit=max(35, limit))
+    if not bars:
+        bars = []
     _bars_cache[key] = bars
     return bars[-limit:] if limit < len(bars) else bars
 
