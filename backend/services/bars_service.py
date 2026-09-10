@@ -105,7 +105,7 @@ def _default_window(days: int = 7) -> tuple[str, str]:
 
 
 async def get_bars(symbol, timeframe="5Min", limit=60, feed="iex"):
-    start, end = _default_window(7)
+    start, end = _default_window(14)
     payload = await _service.get_bars(symbol, start, end, timeframe=timeframe, limit=limit, feed=feed)
     return payload.get("bars", []) if isinstance(payload, dict) else []
 
@@ -137,7 +137,7 @@ async def get_bars_cached(symbol: str, timeframe: str, limit: int) -> list[dict]
         if not bars:
             return []
         return bars[-limit:] if limit < len(bars) else bars
-    bars = await get_bars(symbol, timeframe=timeframe, limit=max(35, limit))
+    bars = await get_bars(symbol, timeframe=timeframe, limit=max(40, limit))
     if not bars:
         bars = []
     _bars_cache[key] = bars
