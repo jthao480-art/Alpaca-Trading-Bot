@@ -994,6 +994,28 @@ class botV3:
                     hold_days = 21
                 else:
                     hold_days = 5
+
+                # Stagnant exit — exit flat positions after 2 days (short-hold only)
+                if trading_days >= 2 and strategy not in ("smarttiq", "nexus"):
+                    pos_check = pos_map.get(symbol)
+                    if pos_check:
+                        entry_price_check = float(open_entry.get("entry_price", 0) or 0)
+                        current_price_check = float(pos_check.get("current_price", 0) or 0)
+                        if entry_price_check > 0 and current_price_check > 0:
+                            gain_pct_check = (current_price_check - entry_price_check) / entry_price_check
+                            if -0.02 <= gain_pct_check <= 0.02:
+                                qty_check = float(pos_check.get("qty", 0))
+                                if qty_check != 0:
+                                    logger.info(
+                                        "Stagnant exit: %s held %d days, gain=%.1f%% — freeing slot",
+                                        symbol, trading_days, gain_pct_check * 100,
+                                    )
+                                    if qty_check < 0:
+                                        await self._close_short_market(abs(qty_check), symbol, ledger)
+                                    else:
+                                        await self._close_position_market(symbol, qty_check, "stagnant_exit", ledger)
+                                    continue
+
                 if trading_days < hold_days:
                     continue
                 pos = pos_map.get(symbol)
