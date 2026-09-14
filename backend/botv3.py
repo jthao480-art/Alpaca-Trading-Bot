@@ -995,8 +995,9 @@ class botV3:
                 else:
                     hold_days = 5
 
-                # Stagnant exit — exit flat positions after 2 days (short-hold only)
-                if trading_days >= 2 and strategy not in ("smarttiq", "nexus"):
+                # Stagnant exit — exit flat positions based on signal type
+                _stagnant_days = 1 if strategy == "intraday" else 3 if strategy == "ares" else 2
+                if trading_days >= _stagnant_days and strategy not in ("smarttiq", "nexus"):
                     pos_check = pos_map.get(symbol)
                     if pos_check:
                         entry_price_check = float(open_entry.get("entry_price", 0) or 0)
