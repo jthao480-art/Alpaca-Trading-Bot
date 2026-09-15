@@ -85,7 +85,7 @@ def _load_blacklist() -> set:
     base = {
         "POEL", "BEEP", "SAFX", "CBUS", "ALGS", "AMOD", "RXT",
         "TGEN", "SHMD", "ARBE", "RDCM", "OUST", "FDMT", "CTM", "CYPH",
-        "GLOB", "SSPC", "CXE", "HWM", "DCTH",
+        "GLOB", "SSPC", "CXE", "HWM", "DCTH", "ARES",
     }
     if not _BLACKLIST_FILE.exists():
         return base
@@ -116,7 +116,7 @@ def _save_blacklist() -> None:
     base = {
         "POEL", "BEEP", "SAFX", "CBUS", "ALGS", "AMOD", "RXT",
         "TGEN", "SHMD", "ARBE", "RDCM", "OUST", "FDMT", "CTM", "CYPH",
-        "GLOB", "SSPC", "CXE", "HWM", "DCTH",
+        "GLOB", "SSPC", "CXE", "HWM", "DCTH", "ARES",
     }
     try:
         existing = {}
