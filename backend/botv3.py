@@ -1219,6 +1219,34 @@ class botV3:
                 if not spy_trend_up and score < 0.72:
                     logger.debug("Skipping %s — SPY downtrend, score %.2f below 0.72 threshold", symbol, score)
                     continue
+                                # Skip low momentum signals (non-tradetiq)
+                if not _is_tradetiq:
+                    momentum_score_check = compute_momentum_score(signal)
+                    if momentum_score_check < 0.30:
+                        logger.debug("Skipping %s — momentum_score %.2f too low", symbol, momentum_score_check)
+                        continue
+
+                # For tradetiq signals, prefer Low risk tag
+                if _is_tradetiq:
+                    risk_tag = str(metadata.get("risk_tag", "")).lower()
+                    if risk_tag and risk_tag != "low":
+                        logger.debug("Skipping %s — risk_tag %s not Low", symbol, risk_tag)
+                        continue
+                    
+                                # Skip low momentum signals (non-tradetiq)
+                if not _is_tradetiq:
+                    momentum_score_check = compute_momentum_score(signal)
+                    if momentum_score_check < 0.30:
+                        logger.debug("Skipping %s — momentum_score %.2f too low", symbol, momentum_score_check)
+                        continue
+
+                # For tradetiq signals, prefer Low risk tag
+                if _is_tradetiq:
+                    risk_tag = str(metadata.get("risk_tag", "")).lower()
+                    if risk_tag and risk_tag != "low":
+                        logger.debug("Skipping %s — risk_tag %s not Low", symbol, risk_tag)
+                        continue
+                    
                 candidates.append({
                     "signal": signal,
                     "symbol": symbol,
