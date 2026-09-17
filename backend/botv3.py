@@ -1222,7 +1222,7 @@ class botV3:
                                 # Skip low momentum signals (non-tradetiq)
                 if not _is_tradetiq:
                     momentum_score_check = compute_momentum_score(signal)
-                    if momentum_score_check < 0.30:
+                    if momentum_score_check < 0.25:
                         logger.debug("Skipping %s — momentum_score %.2f too low", symbol, momentum_score_check)
                         continue
 
