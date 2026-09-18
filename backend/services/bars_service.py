@@ -67,7 +67,9 @@ class Bars_Service:
                 await asyncio.sleep(delay)
                 delay *= 2
 
-        raise last_exc
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"All retries exhausted for {url}")
 
     async def get_bars(self, symbol, start, end, timeframe="5Min", limit=60, feed="iex"):
         path = f"/v2/stocks/{symbol}/bars"
