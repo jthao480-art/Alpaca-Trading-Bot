@@ -266,6 +266,28 @@ async def main() -> None:
         logger.info("Symbol universe reloaded: %d symbols", len(symbols))
         if len(symbols) < 100:
             logger.critical("Symbol universe still too small (%d) — check LD_LIBRARY_PATH", len(symbols))
+
+    # Filter to liquid symbols only — reduces universe from ~7000 to ~1750
+    # This improves scan coverage and signal quality
+    logger.info("Filtering symbol universe to liquid symbols...")
+    from backend.services.bars_service import get_bars
+    liquid_symbols = []
+    for i in range(0, min(len(symbols), 7060), 10):
+        batch = symbols[i:i+10]
+        for sym in batch:
+            try:
+                bars = await get_bars(sym, timeframe='1Day', limit=5)
+                if bars:
+                    avg_vol = sum(b.get('v', 0) for b in bars) / len(bars)
+                    if avg_vol > 100000:
+                        liquid_symbols.append(sym)
+            except Exception:
+                pass
+    if len(liquid_symbols) > 100:
+        symbols = liquid_symbols
+        logger.info("Liquid symbol universe: %d symbols", len(symbols))
+    else:
+        logger.warning("Liquid filter returned too few symbols (%d) — keeping full universe", len(liquid_symbols))
     _last_deferred_check: str = ""   # track which regular session we last ran the deferred check
 
     # Create persistent bot instance — reused across cycles to preserve session state
