@@ -268,6 +268,19 @@ async def main() -> None:
             logger.critical("Symbol universe still too small (%d) — check LD_LIBRARY_PATH", len(symbols))
     _last_deferred_check: str = ""   # track which regular session we last ran the deferred check
 
+    # Create persistent bot instance — reused across cycles to preserve session state
+    bot = botV3(
+        symbols=symbols,
+        trading_client=trading_client,
+        max_concurrent_symbols=int(getattr(config, "MAX_CONCURRENT_SYMBOLS", 50)),
+        batch_size=int(getattr(config, "BATCH_SIZE", 50)),
+        cooldown_minutes=int(getattr(config, "COOLDOWN_MINUTES", 20)),
+        buy_power_cap=float(getattr(config, "BUY_POWER_CAP", 0.20)),
+        early_entry_threshold=float(getattr(config, "EARLY_ENTRY_THRESHOLD", 0.62)),
+        volume_ratio_entry=float(getattr(config, "VOLUME_RATIO_ENTRY", 1.05)),
+        volume_ratio_exit=float(getattr(config, "VOLUME_RATIO_EXIT", 0.95)),
+    )
+
     while True:
         now = _now_et()
         session = _session_name(now)
@@ -292,31 +305,19 @@ async def main() -> None:
         except Exception:
             logger.exception("reconcile_ledger_with_broker failed")
 
-        temp_bot = botV3(symbols=symbols, trading_client=trading_client)
-        if await _close_positions_if_daily_loss(temp_bot, trading_client):
+        if await _close_positions_if_daily_loss(bot, trading_client):
             await asyncio.sleep(30)
             continue
 
         overrides = session_overrides(session)
 
-        bot = botV3(
-            symbols=symbols,
-            trading_client=trading_client,
-            use_news=bool(overrides["use_news"]),
-            use_volume=bool(overrides["use_volume"]),
-            use_momentum=bool(overrides["use_momentum"]),
-            use_forecast=bool(overrides["use_forecast"]),
-            use_fundamentals=bool(overrides["use_fundamentals"]),
-            use_wallet=bool(overrides["use_wallet"]),
-            use_insider=bool(overrides["use_insider"]),
-            max_concurrent_symbols=int(getattr(config, "MAX_CONCURRENT_SYMBOLS", 50)),
-            batch_size=int(getattr(config, "BATCH_SIZE", 50)),
-            cooldown_minutes=int(getattr(config, "COOLDOWN_MINUTES", 20)),
-            buy_power_cap=float(overrides["buy_power_cap"]),
-            early_entry_threshold=float(overrides["early_entry_threshold"]),
-            volume_ratio_entry=float(overrides["volume_ratio_entry"]),
-            volume_ratio_exit=float(overrides["volume_ratio_exit"]),
-        )
+        # Update bot parameters for current session without recreating instance
+        bot.buy_power_cap = float(overrides["buy_power_cap"])
+        bot.early_entry_threshold = float(overrides["early_entry_threshold"])
+        bot.volume_ratio_entry = float(overrides["volume_ratio_entry"])
+        bot.volume_ratio_exit = float(overrides["volume_ratio_exit"])
+        bot.max_concurrent_symbols = int(getattr(config, "MAX_CONCURRENT_SYMBOLS", 50))
+        bot.batch_size = int(getattr(config, "BATCH_SIZE", 50))
 
         result = await bot.run_once(paper_only=bool(getattr(config, "PAPER_TRADING", True)))
         logger.info(
