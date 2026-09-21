@@ -14,6 +14,10 @@ class Bars_Service:
         self._bars_cache = {}
         self._news_cache = {}
         self._cache_ttl_seconds = 45
+        # Keys include start/end timestamps that change on every call, so entries
+        # are rarely read again and were never evicted -> unbounded memory growth.
+        # Cap the cache and drop expired/oldest entries on write.
+        self._cache_max_entries = 1000
 
     def _cache_get(self, cache: dict, key):
         item = cache.get(key)
@@ -26,7 +30,21 @@ class Bars_Service:
         return value
 
     def _cache_set(self, cache: dict, key, value):
-        cache[key] = (time.time(), value)
+        now = time.time()
+        cache[key] = (now, value)
+        if len(cache) > self._cache_max_entries:
+            self._cache_evict(cache, now)
+
+    def _cache_evict(self, cache: dict, now: float) -> None:
+        # 1) drop everything past its TTL
+        ttl = self._cache_ttl_seconds
+        for k in [k for k, (ts, _) in cache.items() if now - ts > ttl]:
+            cache.pop(k, None)
+        # 2) still over the cap (burst inside the TTL): drop oldest-inserted down
+        #    to 90% so we don't re-run this on every single write.
+        target = int(self._cache_max_entries * 0.9)
+        while len(cache) > target:
+            cache.pop(next(iter(cache)), None)
 
     async def _get_with_retry(self, url, *, params=None, cache=None, cache_key=None):
         if cache is not None and cache_key is not None:

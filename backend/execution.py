@@ -245,6 +245,11 @@ async def _buy_risk_check(symbol: str, qty: float, price: float) -> tuple[bool, 
 
         if buying_power <= 0:
             return False, "no_buying_power", 0.0
+        # Cash reserve check — never trade below minimum cash reserve
+        MIN_CASH_RESERVE = float(getattr(config, "MIN_CASH_RESERVE", 0.0))
+        cash = float(acct.get("cash") or 0)
+        if MIN_CASH_RESERVE > 0 and cash - (qty * price) < MIN_CASH_RESERVE:
+            return False, "cash_reserve_floor_hit", 0.0
 
         positions = await _get_open_positions()
         if len(positions) >= MAX_POSITIONS:
@@ -290,6 +295,21 @@ async def _buy_risk_check(symbol: str, qty: float, price: float) -> tuple[bool, 
         return False, str(exc), 0.0
 
 
+def _order_ctx(payload) -> str:
+    """Diagnostic only: describe the order and the call chain that produced it."""
+    try:
+        import inspect
+        data = payload if isinstance(payload, dict) else {}
+        frames = [f.function for f in inspect.stack()[2:8]]
+        return (
+            f"symbol={data.get('symbol')} side={data.get('side')} "
+            f"type={data.get('type') or data.get('order_type')} qty={data.get('qty')} "
+            f"caller={'<'.join(frames)}"
+        )
+    except Exception:
+        return "ctx_unavailable"
+
+
 async def _post_order(payload: dict) -> Optional[dict]:
     url = f"{ALPACA_BASE_URL}/v2/orders"
     retryable_statuses = {429, 500, 502, 503, 504}
@@ -307,11 +327,17 @@ async def _post_order(payload: dict) -> Optional[dict]:
                 return resp.json()
 
             if resp.status_code == 403:
-                logger.warning("Non-retryable order rejection: %s %s", resp.status_code, resp.text)
+                logger.warning(
+                    "Non-retryable order rejection: %s %s | ctx=%s",
+                    resp.status_code, resp.text, _order_ctx(payload),
+                )
                 return None
 
             if resp.status_code not in retryable_statuses:
-                logger.warning("Non-retryable order rejection: %s %s", resp.status_code, resp.text)
+                logger.warning(
+                    "Non-retryable order rejection: %s %s | ctx=%s",
+                    resp.status_code, resp.text, _order_ctx(payload),
+                )
                 if resp.status_code == 422 and "not active" in resp.text.lower():
                     symbol = str(payload.get("symbol", "")).upper()
                     if symbol:
@@ -385,6 +411,55 @@ async def _cancel_all_open_sell_orders(symbol: str) -> None:
             await asyncio.sleep(_CANCEL_SETTLE_DELAY)
     except Exception:
         logger.exception("Failed to cancel open sell orders for %s", symbol)
+
+
+_TERMINAL_STATUSES = {"filled", "canceled", "rejected", "expired", "done_for_day", "replaced"}
+
+
+async def _open_orders_on_side(symbol: str, side: str) -> list[dict]:
+    """Open (non-terminal) orders for `symbol` on `side` ('buy' or 'sell')."""
+    symbol = symbol.upper()
+    side = side.lower()
+    orders = await _get_open_orders_for_symbol(symbol)
+    return [
+        o for o in orders
+        if str(o.get("symbol", "")).upper() == symbol
+        and str(o.get("side", "")).lower() == side
+        and str(o.get("status", "")).lower() not in _TERMINAL_STATUSES
+    ]
+
+
+async def _cancel_all_open_orders_for_side(symbol: str, side: str) -> bool:
+    """Cancel every open order for `symbol` on `side` and wait until they are gone.
+
+    Returns True once none remain, False if something is still holding shares
+    after the settle window (callers must then NOT submit an opposing order,
+    because Alpaca rejects it with 403 'insufficient qty available').
+    """
+    try:
+        for order in await _open_orders_on_side(symbol, side):
+            oid = order.get("id")
+            if oid:
+                await _cancel_order_by_id(str(oid))
+        for _ in range(_CANCEL_SETTLE_ATTEMPTS):
+            if not await _open_orders_on_side(symbol, side):
+                return True
+            await asyncio.sleep(_CANCEL_SETTLE_DELAY)
+        return False
+    except Exception:
+        logger.exception("Failed to cancel open %s orders for %s", side, symbol)
+        return False
+
+
+async def _held_buy_qty(symbol: str) -> float:
+    """Shares of a short already reserved by open buy (cover/stop) orders."""
+    held = 0.0
+    for order in await _open_orders_on_side(symbol, "buy"):
+        try:
+            held += float(order.get("qty") or order.get("remaining_qty") or 0)
+        except Exception:
+            continue
+    return held
 
 
 async def cancel_other_stop(filled_symbol: str) -> None:
@@ -550,6 +625,17 @@ async def place_market_sell(symbol: str, qty: float) -> Optional[str]:
 
         available_qty = await _available_exit_qty(symbol, qty)
         if available_qty <= 0:
+            # If a sell order is STILL open, the shares are reserved and Alpaca
+            # will 403 ("insufficient qty available") on anything we send.
+            # Only fall back to the raw position qty when nothing holds it.
+            blockers = await _open_orders_on_side(symbol, "sell")
+            if blockers:
+                logger.warning(
+                    "Skipping market sell for %s: qty held by open sell order(s) %s",
+                    symbol,
+                    [(str(o.get("id", ""))[:8], o.get("type"), o.get("status")) for o in blockers],
+                )
+                return None
             positions = await _get_open_positions()
             for pos in positions:
                 if str(pos.get("symbol", "")).upper() == symbol.upper():
@@ -632,6 +718,7 @@ async def place_bracket_buy(
 
     # ── exit protection ───────────────────────────────────────────────────────
     trail_id = None
+    settled: Optional[bool] = None   # only set when we try to swap in a trailing stop
     _in_regular_hours = _is_regular_market_hours()
 
     if use_trailing and _in_regular_hours:
@@ -692,7 +779,7 @@ async def place_bracket_buy(
         except Exception:
             logger.exception("Failed to attach trailing stop for %s", symbol)
 
-    else:
+    elif not _in_regular_hours:
         # After hours: bracket legs (hard stop + take profit) stay active overnight.
         # Queue a deferred trailing stop — at market open, attach_deferred_trailing_stops()
         # will cancel the bracket legs and replace them with a trailing stop.
@@ -704,6 +791,15 @@ async def place_bracket_buy(
             "trailing stop queued for market open",
             symbol, take_profit_price, stop_loss_price,
         )
+    else:
+        # Regular hours, use_trailing=False (SmartTiq / Nexus long-hold plan):
+        # deliberately no trailing stop. The -8% hard stop is attached by
+        # botV3._protect_positions once the ledger entry exists.
+        logger.info(
+            "Regular hours buy %s — long-hold plan, no trailing stop "
+            "(hard stop attached by protect pass)",
+            symbol,
+        )
     # ── end exit protection ───────────────────────────────────────────────────
 
     open_stops[symbol] = {
@@ -712,11 +808,16 @@ async def place_bracket_buy(
         "trail": trail_id or "",
     }
 
-    logger.info(
-        "place_bracket_buy complete: %s entry=%.2f tp=%.2f sl=%.2f trail=%s in_hours=%s settled=%s",
-        symbol, filled_price, take_profit_price, stop_loss_price, trail_id, _in_regular_hours,
-        settled if _in_regular_hours else "n/a",
-    )
+    # The order has already filled at this point — a logging problem must never
+    # raise and make the caller lose the order id (and skip the ledger entry).
+    try:
+        logger.info(
+            "place_bracket_buy complete: %s entry=%.2f tp=%.2f sl=%.2f trail=%s in_hours=%s settled=%s",
+            symbol, filled_price, take_profit_price, stop_loss_price, trail_id, _in_regular_hours,
+            settled if settled is not None else "n/a",
+        )
+    except Exception:
+        logger.exception("place_bracket_buy: completion log failed for %s", symbol)
 
     return order_id, filled_price
 
@@ -727,6 +828,9 @@ async def place_market_short(
     stop_loss_price: Optional[float] = None,
 ) -> Tuple[Optional[str], Optional[float]]:
     """Place a market sell-short order with optional bracket legs."""
+    if not getattr(config, "ENABLE_SHORTS", False):
+        logger.info("Skipping short for %s: ENABLE_SHORTS is off", symbol)
+        return None, None
     price = await get_latest_price(symbol)
     if not price:
         logger.warning("Skipping short for %s: no price available", symbol)
@@ -770,9 +874,16 @@ async def place_trailing_stop_buy(symbol: str, qty: float, trail_percent: float)
     """Place a trailing stop BUY to cover a short position."""
     if qty <= 0 or trail_percent <= 0:
         return None
+    # Mirror place_trailing_stop_sell: don't submit if open buy orders (hard
+    # stop / earlier trailing stop) already reserve the short's shares — Alpaca
+    # rejects that with 403 insufficient qty.
+    available = max(0.0, abs(qty) - await _held_buy_qty(symbol))
+    if available <= 0:
+        logger.info("Skipping trailing stop buy for %s: qty already held by open buy order", symbol)
+        return None
     payload = TrailingStopOrderRequest(
         symbol=symbol,
-        qty=abs(qty),
+        qty=available,
         side=OrderSide.BUY,
         time_in_force=TimeInForce.GTC,
         trail_percent=float(trail_percent),
@@ -783,6 +894,61 @@ async def place_trailing_stop_buy(symbol: str, qty: float, trail_percent: float)
         open_stops.setdefault(symbol, {})["trail"] = str(result.get("id"))
         return result.get("id")
     return None
+
+
+async def place_market_cover(symbol: str, qty: float) -> Optional[str]:
+    """Buy to cover an existing short at market.
+
+    Cancels the short's open buy-side orders (trailing stop / hard stop) first
+    and waits for them to release the shares, then covers the ACTUAL short size.
+    Previously covers went through place_market_buy, which left the stop holding
+    the shares -> 403 'insufficient qty available' every cycle. This also skips
+    the new-long risk checks (max positions, buying power trim), which must not
+    block closing a position.
+    """
+    symbol = symbol.upper()
+    if qty <= 0:
+        return None
+    if symbol in _exit_locks:
+        logger.warning("Skipping cover for %s: exit locked", symbol)
+        return None
+
+    _exit_locks.add(symbol)
+    try:
+        short_qty = 0.0
+        for pos in await _get_open_positions():
+            if str(pos.get("symbol", "")).upper() == symbol:
+                try:
+                    short_qty = float(pos.get("qty") or 0)
+                except Exception:
+                    short_qty = 0.0
+                break
+        if short_qty >= 0:
+            logger.warning("Skipping cover for %s: no short position found (qty=%s)", symbol, short_qty)
+            return None
+
+        await _cancel_linked_exits(symbol)
+        if not await _cancel_all_open_orders_for_side(symbol, "buy"):
+            blockers = await _open_orders_on_side(symbol, "buy")
+            logger.warning(
+                "Skipping cover for %s: qty still held by open buy order(s) %s",
+                symbol,
+                [(str(o.get("id", ""))[:8], o.get("type"), o.get("status")) for o in blockers],
+            )
+            return None
+
+        cover_qty = abs(short_qty)
+        payload = {
+            "symbol": symbol,
+            "qty": str(int(cover_qty)) if cover_qty == int(cover_qty) else str(cover_qty),
+            "side": "buy",
+            "type": "market",
+            "time_in_force": "day",
+        }
+        result = await _post_order(payload)
+        return result.get("id") if result else None
+    finally:
+        _exit_locks.discard(symbol)
 
 
 async def _short_risk_check(symbol: str, qty: float, price: float) -> tuple[bool, str, float]:

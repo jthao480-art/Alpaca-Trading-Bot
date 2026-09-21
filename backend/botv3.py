@@ -169,6 +169,26 @@ def _cfg_any_float(*names: str, default: float = 0.0) -> float:
     return float(default)
 
 
+_LONG_HOLD_KINDS = ("smarttiq", "nexus")
+
+
+def _entry_kind(entry: dict[str, Any] | None) -> str:
+    """Strategy label for a ledger entry.
+
+    The ledger stores the *agent* name as `strategy` (always "tradetiq" for
+    Tradetiq signals); SmartTiq / Nexus only appear as `metadata.signal_type`.
+    Return that signal_type for those two so the long-hold rules (no trailing
+    stop, hard stop at -8%, 21/35-day hold, no EOD/stagnant exit) really apply.
+    """
+    if not entry:
+        return ""
+    strategy = str(entry.get("strategy", "")).lower()
+    if strategy in _LONG_HOLD_KINDS:
+        return strategy
+    sig_type = str((entry.get("metadata") or {}).get("signal_type", "")).lower()
+    return sig_type if sig_type in _LONG_HOLD_KINDS else strategy
+
+
 def compute_momentum_score(signal: dict[str, Any]) -> float:
     metadata = signal.get("metadata", {}) or {}
     base_score = float(signal.get("score", 0.0) or 0.0)
@@ -816,7 +836,7 @@ class botV3:
                     if isinstance(_sym_entries, list):
                         _open = next((e for e in reversed(_sym_entries) if e.get("status") == "open"), None)
                         if _open:
-                            _sym_strategy = str(_open.get("strategy", "")).lower()
+                            _sym_strategy = _entry_kind(_open)
                     if _sym_strategy in ("smarttiq", "nexus"):
                         logger.info("EOD sweep skipped for %s — long-hold signal (%s)", symbol, _sym_strategy)
                         continue
@@ -854,7 +874,7 @@ class botV3:
                     if isinstance(_sym_entries, list):
                         _open = next((e for e in reversed(_sym_entries) if e.get("status") == "open"), None)
                         if _open:
-                            _sym_strategy = str(_open.get("strategy", "")).lower()
+                            _sym_strategy = _entry_kind(_open)
                     _is_long_hold = _sym_strategy in ("smarttiq", "nexus")
                     if _is_long_hold and not has_hard_stop:
                         price = await get_latest_price(symbol)
@@ -950,8 +970,8 @@ class botV3:
     async def _close_short_market(self, qty: float, symbol: str, ledger: Any) -> None:
         """Buy to cover a short position at market."""
         try:
-            from backend.execution import place_market_buy
-            order_id, _ = await place_market_buy(symbol, qty)
+            from backend.execution import place_market_cover
+            order_id = await place_market_cover(symbol, qty)
             if order_id:
                 close_entry(ledger, symbol=symbol, order_id=order_id, exit_price=None, reason="time_exit_cover", cooldown_minutes=self.cooldown_minutes)
                 _BOUGHT_THIS_SESSION.add(symbol)
@@ -987,7 +1007,7 @@ class botV3:
                     if not created_at:
                         continue
                 trading_days = self._count_trading_days(created_at, now)
-                strategy = str(open_entry.get("strategy", "")).lower()
+                strategy = _entry_kind(open_entry)
                 if strategy == "nexus":
                     hold_days = 35
                 elif strategy in ("ares", "tradetiq", "smarttiq"):
@@ -1149,9 +1169,10 @@ class botV3:
             if symbol in BLACKLIST:
                 logger.info("Skipping %s — blacklisted", symbol)
                 continue
-            if already_have_position(self.trading_client, symbol):
-                logger.info("Skipping %s — position already open", symbol)
-                continue
+            # NOTE: held symbols must NOT be skipped here — the exit logic below
+            # (open_qty > 0) has to see them. Duplicate-entry protection lives
+            # in the open_qty checks and a live position check right before a
+            # symbol is queued as a buy candidate.
             if symbol in _PENDING_BUYS:
                 continue
             if symbol in _BOUGHT_THIS_SESSION:
@@ -1169,11 +1190,22 @@ class botV3:
             if symbol in open_positions:
                 open_qty = float(open_positions.get(symbol, 0.0) or 0.0)
             if open_qty > 0:
+                # Long-hold (SmartTiq / Nexus) positions are held to their validated day.
+                _held_entries = ledger.get(symbol, [])
+                _held_open = (
+                    next((e for e in reversed(_held_entries) if e.get("status") == "open"), None)
+                    if isinstance(_held_entries, list) else None
+                )
+                if _entry_kind(_held_open) in _LONG_HOLD_KINDS:
+                    continue
                 exit_reason = None
                 _is_intraday = str(signal.get("agent", "")).lower() == "intraday"
-                if not _is_intraday and volume_slope < 0:
+                # Only trust volume-based exits when this symbol actually has volume data;
+                # a missing ratio defaults to 0.0 and would otherwise look like a "fade".
+                _has_volume_data = bool(_vol_data) or "volume_ratio" in metadata
+                if not _is_intraday and _has_volume_data and volume_slope < 0:
                     exit_reason = "volume_slope_negative"
-                elif not _is_intraday and volume_ratio < self.volume_ratio_exit:
+                elif not _is_intraday and _has_volume_data and volume_ratio < self.volume_ratio_exit:
                     exit_reason = "volume_ratio_fade"
                 elif direction == "sell" and confidence >= 0.5:
                     exit_reason = "sell_signal"
@@ -1206,6 +1238,8 @@ class botV3:
                     finally:
                         _PENDING_SELLS.discard(symbol)
                 continue
+            if open_qty < 0:
+                continue  # short position open — a buy signal must never be treated as an entry
             if direction == "buy":
                 if score < max(0.62, self.early_entry_threshold):
                     continue
@@ -1247,6 +1281,11 @@ class botV3:
                         logger.debug("Skipping %s — risk_tag %s not Low", symbol, risk_tag)
                         continue
                     
+                # Live check only for symbols that actually passed every filter
+                # (a handful per cycle), instead of one blocking API call per signal.
+                if already_have_position(self.trading_client, symbol):
+                    logger.info("Skipping %s — position already open", symbol)
+                    continue
                 candidates.append({
                     "signal": signal,
                     "symbol": symbol,
@@ -1255,6 +1294,8 @@ class botV3:
                     "priority": trade_priority(signal),
                 })
             elif direction == "sell" and open_qty == 0:
+                if not getattr(config, "ENABLE_SHORTS", False):
+                    continue
                 if score < 0.75:
                     continue
                 if confidence < 0.65:
@@ -1478,7 +1519,7 @@ class botV3:
         symbols = list(self.symbols)
         import random
         random.shuffle(symbols)
-        symbols = symbols[:1000]
+        symbols = symbols[:2000]
         for i in range(0, len(symbols), self.batch_size):
             batch = symbols[i: i + self.batch_size]
             try:

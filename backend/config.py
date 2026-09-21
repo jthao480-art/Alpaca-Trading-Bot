@@ -36,11 +36,15 @@ TAKE_PROFIT_PCT = float(_env.get("TAKE_PROFIT_PCT", "0.04"))
 STOP_LOSS_PCT = float(_env.get("STOP_LOSS_PCT", "0.06"))
 DAILY_LOSS_LIMIT_USD = float(_env.get("DAILY_LOSS_LIMIT_USD", "2000.0"))
 DAILY_LOSS_LIMIT = -float(_env.get("DAILY_LOSS_LIMIT_USD", "2000.0"))
+MIN_CASH_RESERVE = float(_env.get("MIN_CASH_RESERVE", "0.0"))
 HARD_STOP_TRIGGER_PCT = float(_env.get("HARD_STOP_TRIGGER_PCT", "-0.055"))
 SESSION_FLATTEN_TIME = _env.get("SESSION_FLATTEN_TIME", "15:45")
 USE_ALL_TRADABLE = _env.get("USE_ALL_TRADABLE", "false").lower() == "true"
 MAX_LEVERAGE = float(_env.get("MAX_LEVERAGE", "1.5"))
 MAX_SHORT_LEVERAGE = float(_env.get("MAX_SHORT_LEVERAGE", "0.5"))
+# Master switch for OPENING new shorts. Paper bot keeps shorting by default; set
+# ENABLE_SHORTS=false in Railway to turn it off. Existing shorts are still protected/covered.
+ENABLE_SHORTS = _env.get("ENABLE_SHORTS", "true").lower() == "true"
 MAX_CONCURRENT_SYMBOLS = int(_env.get("MAX_CONCURRENT_SYMBOLS", "10"))
 BATCH_SIZE = int(_env.get("BATCH_SIZE", "25"))
 MAX_POSITIONS = int(_env.get("MAX_POSITIONS", "25"))
