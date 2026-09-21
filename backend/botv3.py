@@ -1130,7 +1130,7 @@ class botV3:
         await self._session_exit_pass(ledger)
         await self._end_of_day_sweep(ledger)
         if not under_position_limit(self.trading_client):
-            logger.debug("handle_signals_stop reason=position_limit")
+            logger.info("handle_signals_stop reason=position_limit")
             save_ledger(ledger)
             return
         if HALT_ENTRIES:
@@ -1138,12 +1138,17 @@ class botV3:
             save_ledger(ledger)
             return
         if not await self._market_allows_longs():
-            logger.debug("handle_signals_stop reason=market_filter")
+            logger.info("handle_signals_stop reason=market_filter (market does not allow longs)")
             save_ledger(ledger)
             return
         self.order_size_multiplier = self._vix_session_multiplier()
         candidates: list[dict[str, Any]] = []
         short_candidates: list[dict[str, Any]] = []
+        _skips: dict[str, int] = {}
+
+        def _skip(reason: str) -> None:
+            _skips[reason] = _skips.get(reason, 0) + 1
+
         # Build per-symbol volume data lookup from volume agent signals
         symbol_volume_data: dict[str, dict] = {}
         for signal in signals:
@@ -1174,9 +1179,10 @@ class botV3:
             # in the open_qty checks and a live position check right before a
             # symbol is queued as a buy candidate.
             if symbol in _PENDING_BUYS:
+                _skip("pending_buy")
                 continue
             if symbol in _BOUGHT_THIS_SESSION:
-                logger.info("Skipping %s — already bought this session", symbol)
+                _skip("already_bought_this_session")
                 continue
             _vol_data = symbol_volume_data.get(symbol, {})
             volume_ratio = float(_vol_data.get("volume_ratio") or metadata.get("volume_ratio", 0.0) or 0.0)
@@ -1185,6 +1191,7 @@ class botV3:
             breakout = bool(_vol_data.get("breakout") or metadata.get("breakout", False))
             in_cooldown, _ = is_in_cooldown(ledger, symbol)
             if in_cooldown:
+                _skip("cooldown")
                 continue
             open_qty = 0.0
             if symbol in open_positions:
@@ -1242,49 +1249,52 @@ class botV3:
                 continue  # short position open — a buy signal must never be treated as an entry
             if direction == "buy":
                 if score < max(0.62, self.early_entry_threshold):
+                    _skip("score_below_threshold")
                     continue
                 if confidence < 0.25:
+                    _skip("confidence<0.25")
                     continue
                 _is_intraday = str(signal.get("agent", "")).lower() == "intraday"
                 _intraday_active = bool(metadata.get("intraday_active", False))
                 _is_tradetiq = str(signal.get("agent", "")).lower() == "tradetiq"
                 if not _is_intraday and not _is_tradetiq and not (volume_ratio >= self.volume_ratio_entry or breakout or volume_acceleration >= 0.95):
+                    _skip("volume_filter")
                     continue
                 if not spy_trend_up and score < 0.72:
-                    logger.debug("Skipping %s — SPY downtrend, score %.2f below 0.72 threshold", symbol, score)
+                    _skip("spy_downtrend_score<0.72")
                     continue
                                 # Skip low momentum signals (non-tradetiq)
                 if not _is_tradetiq:
                     momentum_score_check = compute_momentum_score(signal)
-                    if momentum_score_check < 0.20:
-                        logger.debug("Skipping %s — momentum_score %.2f too low", symbol, momentum_score_check)
+                    if momentum_score_check < 0.25:
+                        _skip("momentum<0.25")
                         continue
 
                 # For tradetiq signals, prefer Low risk tag
                 if _is_tradetiq:
                     risk_tag = str(metadata.get("risk_tag", "")).lower()
                     if risk_tag and risk_tag != "low":
-                        logger.debug("Skipping %s — risk_tag %s not Low", symbol, risk_tag)
+                        _skip(f"tradetiq_risk_tag={risk_tag}")
                         continue
                     
                                 # Skip low momentum signals (non-tradetiq)
                 if not _is_tradetiq:
                     momentum_score_check = compute_momentum_score(signal)
-                    if momentum_score_check < 0.20:
-                        logger.debug("Skipping %s — momentum_score %.2f too low", symbol, momentum_score_check)
+                    if momentum_score_check < 0.30:
+                        _skip("momentum<0.30")
                         continue
 
                 # For tradetiq signals, prefer Low risk tag
                 if _is_tradetiq:
                     risk_tag = str(metadata.get("risk_tag", "")).lower()
                     if risk_tag and risk_tag != "low":
-                        logger.debug("Skipping %s — risk_tag %s not Low", symbol, risk_tag)
+                        _skip(f"tradetiq_risk_tag={risk_tag}")
                         continue
                     
                 # Live check only for symbols that actually passed every filter
                 # (a handful per cycle), instead of one blocking API call per signal.
                 if already_have_position(self.trading_client, symbol):
-                    logger.info("Skipping %s — position already open", symbol)
+                    _skip("position_already_open")
                     continue
                 candidates.append({
                     "signal": signal,
@@ -1331,6 +1341,15 @@ class botV3:
                     "priority": trade_priority(signal),
                 })
 
+        _dirs: dict[str, int] = {}
+        for _s in signals:
+            _d = str(_s.get("direction", "hold"))
+            _dirs[_d] = _dirs.get(_d, 0) + 1
+        logger.info(
+            "Signal summary: signals=%d directions=%s candidates=%d short_candidates=%d spy_up=%s skips=%s",
+            len(signals), _dirs, len(candidates), len(short_candidates), spy_trend_up, _skips or "{}",
+        )
+
         # Process long candidates — only during entry hours
         for item in candidates:
             _now_check = datetime.now(ET)
@@ -1345,15 +1364,21 @@ class botV3:
             metadata = signal.get("metadata", {}) or {}
             price = await get_latest_price(symbol)
             if not price:
+                logger.info("Candidate %s dropped — no price", symbol)
                 continue
             min_price = float(getattr(config, "MIN_PRICE", 4.0))
             if price < min_price:
-                logger.debug("Skipping %s — price %.2f below $%.2f minimum", symbol, price, min_price)
+                logger.info("Candidate %s dropped — price %.2f below $%.2f minimum", symbol, price, min_price)
                 continue
             buying_power = float(get_account_buying_power() or 0.0)
             min_cash_reserve = float(getattr(config, "MIN_CASH_RESERVE", 0.0))
+            _raw_bp = buying_power
             buying_power = max(0.0, buying_power - min_cash_reserve)
             if buying_power <= 0:
+                logger.info(
+                    "Candidate %s dropped — no buying power after reserve (bp=%.2f reserve=%.2f)",
+                    symbol, _raw_bp, min_cash_reserve,
+                )
                 continue
             max_position_usd = _cfg_any_float("MAX_POSITION_SIZE_USD", "MAX_POSITION_SIZE", default=10000.0)
             position_pct = _cfg_float("POSITION_SIZE_PCT", 0.10)
@@ -1368,6 +1393,9 @@ class botV3:
             allowed_dollars = min(allowed_dollars * mult, max_position_usd)
             qty = int(allowed_dollars // float(price))
             if qty < 1:
+                logger.info(
+                    "Candidate %s dropped — qty<1 (allowed=$%.2f price=$%.2f)", symbol, allowed_dollars, float(price),
+                )
                 continue
             exit_plan = build_exit_plan(signal)
             _PENDING_BUYS.add(symbol)

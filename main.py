@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -103,6 +103,28 @@ def build_trading_client() -> TradingClient:
         raise RuntimeError("Missing Alpaca API credentials")
 
     return TradingClient(api_key, api_secret, paper=paper)
+
+
+async def _log_clock_check(trading_client: TradingClient, session: str) -> None:
+    """Log the container clock next to Alpaca's own market clock, and warn on drift."""
+    now_utc = datetime.now(timezone.utc)
+    now_et = now_utc.astimezone(ET)
+    try:
+        clock = await asyncio.to_thread(trading_client.get_clock)
+        broker_ts = getattr(clock, "timestamp", None)
+        drift = abs((broker_ts - now_utc).total_seconds()) if broker_ts else None
+        logger.info(
+            "CLOCK utc=%s et=%s session=%s | alpaca is_open=%s ts=%s next_open=%s next_close=%s drift=%ss",
+            now_utc.strftime("%Y-%m-%d %H:%M:%S"), now_et.strftime("%Y-%m-%d %H:%M:%S %a"), session,
+            getattr(clock, "is_open", None), broker_ts,
+            getattr(clock, "next_open", None), getattr(clock, "next_close", None),
+            "n/a" if drift is None else int(drift),
+        )
+        if drift is not None and drift > 120:
+            logger.warning("CLOCK DRIFT: container clock is off from Alpaca's by %ds", int(drift))
+    except Exception as exc:
+        logger.warning("CLOCK check failed (%s); container utc=%s et=%s session=%s",
+                       exc, now_utc.strftime("%H:%M:%S"), now_et.strftime("%Y-%m-%d %H:%M:%S %a"), session)
 
 
 async def _close_positions_if_daily_loss(bot: botV3, trading_client: TradingClient) -> bool:
@@ -269,6 +291,8 @@ async def main() -> None:
 
 
     _last_deferred_check: str = ""   # track which regular session we last ran the deferred check
+    _cycle_n = 0
+    _last_logged_session = ""
 
     # Create persistent bot instance — reused across cycles to preserve session state
     bot = botV3(
@@ -290,6 +314,11 @@ async def main() -> None:
         if session == "closed":
             await _sleep_until(_next_session_start(now))
             continue
+
+        _cycle_n += 1
+        if session != _last_logged_session or _cycle_n % 20 == 1:
+            await _log_clock_check(trading_client, session)
+            _last_logged_session = session
 
         # Run deferred trailing stop attachment once per regular session open
         if session == "regular":
@@ -323,13 +352,11 @@ async def main() -> None:
 
         result = await bot.run_once(paper_only=bool(getattr(config, "PAPER_TRADING", True)))
         logger.info(
-            "Session=%s scanned=%s signals=%s buys=%s sells=%s holds=%s",
+            "Session=%s scanned=%s signals=%s errors=%s",
             session,
             len(result.get("symbols", [])),
             len(result.get("signals", [])),
-            len(result.get("buys", [])),
-            len(result.get("sells", [])),
-            len(result.get("holds", [])),
+            result.get("errors", 0),
         )
 
         await asyncio.sleep(_sleep_seconds_for_session(session))

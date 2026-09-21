@@ -1,7 +1,10 @@
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
+
+import httpx
 
 from .auth import alpaca_request_async
 
@@ -18,6 +21,18 @@ class Bars_Service:
         # are rarely read again and were never evicted -> unbounded memory growth.
         # Cap the cache and drop expired/oldest entries on write.
         self._cache_max_entries = 1000
+        # Data-API rate control. Scans fire hundreds of bar requests at once; when
+        # Alpaca answers 429 every task used to back off on its own, retry into the
+        # same wall and finally give up ("All retries exhausted"). Now:
+        #  - at most BARS_MAX_CONCURRENCY requests in flight,
+        #  - one 429 pauses ALL bar requests until Retry-After / the backoff elapses,
+        #  - optional hard pacing via BARS_MAX_PER_MIN (0 = off; e.g. 190 for the free plan).
+        self._max_concurrency = max(1, int(os.getenv("BARS_MAX_CONCURRENCY", "8") or 8))
+        _per_min = float(os.getenv("BARS_MAX_PER_MIN", "0") or 0)
+        self._min_interval = (60.0 / _per_min) if _per_min > 0 else 0.0
+        self._sem = None
+        self._blocked_until = 0.0
+        self._next_slot = 0.0
 
     def _cache_get(self, cache: dict, key):
         item = cache.get(key)
@@ -46,6 +61,42 @@ class Bars_Service:
         while len(cache) > target:
             cache.pop(next(iter(cache)), None)
 
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        # created lazily so it binds to the running loop (older Pythons bind at construction)
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(self._max_concurrency)
+        return self._sem
+
+    async def _wait_for_slot(self) -> None:
+        """Wait out any global 429 pause, then (optionally) take a paced request slot."""
+        while True:
+            remaining = self._blocked_until - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(remaining, 5.0))
+        if self._min_interval:
+            now = time.monotonic()
+            slot = max(now, self._next_slot)
+            self._next_slot = slot + self._min_interval
+            if slot > now:
+                await asyncio.sleep(slot - now)
+
+    def _note_rate_limit(self, resp, fallback_delay: float, url: str, attempt: int) -> float:
+        wait = fallback_delay
+        try:
+            ra = resp.headers.get("Retry-After")
+            if ra:
+                wait = max(wait, float(ra))
+        except Exception:
+            pass
+        until = time.monotonic() + wait
+        if until > self._blocked_until + 0.5:
+            # only a request that meaningfully extends the pause logs, so a burst of
+            # simultaneous 429s produces one line instead of hundreds
+            self._blocked_until = until
+            logger.warning("429 on %s (attempt %s/5); pausing all bar requests %.1fs", url, attempt, wait)
+        return wait
+
     async def _get_with_retry(self, url, *, params=None, cache=None, cache_key=None):
         if cache is not None and cache_key is not None:
             cached = self._cache_get(cache, cache_key)
@@ -57,17 +108,16 @@ class Bars_Service:
 
         for attempt in range(1, 6):
             try:
-                resp = await alpaca_request_async("GET", url, params=params, use_data_api=True)
+                async with self._get_semaphore():
+                    # checked after acquiring the semaphore so requests that queued up
+                    # before a 429 arrived still honour the pause
+                    await self._wait_for_slot()
+                    resp = await alpaca_request_async("GET", url, params=params, use_data_api=True)
 
                 if resp.status_code == 429:
-                    logger.warning(
-                        "429 on %s (attempt %s/5); backing off %.1fs",
-                        url,
-                        attempt,
-                        delay,
-                    )
-                    await asyncio.sleep(delay)
-                    delay *= 2
+                    self._note_rate_limit(resp, delay, url, attempt)
+                    delay = min(delay * 2, 30.0)
+                    last_exc = RuntimeError(f"429 rate limited: {url}")
                     continue
 
                 resp.raise_for_status()
@@ -78,12 +128,22 @@ class Bars_Service:
 
                 return data
 
+            except httpx.HTTPStatusError as exc:
+                # 4xx (other than 408/429) will not succeed on retry: fail fast
+                code = exc.response.status_code if exc.response is not None else 0
+                if 400 <= code < 500 and code not in (408, 429):
+                    raise
+                last_exc = exc
+                if attempt == 5:
+                    raise
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
             except Exception as exc:
                 last_exc = exc
                 if attempt == 5:
                     raise
                 await asyncio.sleep(delay)
-                delay *= 2
+                delay = min(delay * 2, 30.0)
 
         if last_exc is not None:
             raise last_exc

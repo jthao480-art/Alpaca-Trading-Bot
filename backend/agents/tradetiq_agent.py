@@ -152,11 +152,25 @@ def _build_symbol_map(data: dict, enabled: set[str]) -> dict[str, list[dict]]:
     return symbol_map
 
 
+# A response with zero usable signals is NOT treated as "done for the day":
+# signals can be published after the bot's first fetch, so an empty list is
+# re-checked every _EMPTY_REFRESH_SECONDS. Failed/empty fetches are also
+# throttled to one attempt per _RETRY_MIN_SECONDS (previously every symbol
+# analysed during an outage re-hit the API).
+_EMPTY_REFRESH_SECONDS = 600
+_RETRY_MIN_SECONDS = 60
+
+
 async def _ensure_cache_fresh() -> None:
     async with _CACHE_LOCK:
         today = datetime.now(ET).strftime("%Y-%m-%d")
-        if _CACHE["date"] == today and _CACHE["data"] is not None:
+        now_ts = time.time()
+        have_today = _CACHE["date"] == today and _CACHE["data"] is not None
+        if have_today and (_CACHE["symbol_map"] or now_ts - _CACHE["ts"] < _EMPTY_REFRESH_SECONDS):
             return
+        if now_ts - _CACHE.get("last_attempt", 0.0) < _RETRY_MIN_SECONDS:
+            return
+        _CACHE["last_attempt"] = now_ts
         logger.info("Fetching Tradetiq todays-signals-bot for %s", today)
         data = await _fetch_todays_signals()
         if data:
@@ -170,6 +184,17 @@ async def _ensure_cache_fresh() -> None:
                 "Tradetiq cache: %d symbols, %d signals, enabled=%s",
                 len(_CACHE["symbol_map"]), total, enabled,
             )
+            try:
+                raw_eod = {k: len(v or []) for k, v in (data.get("eod") or {}).items()}
+                raw_prov = {k: len(v or []) for k, v in (data.get("provisional") or {}).items()}
+                logger.info("Tradetiq raw payload: eod=%s provisional=%s", raw_eod, raw_prov)
+            except Exception:
+                pass
+            if total == 0:
+                logger.warning(
+                    "Tradetiq returned no usable signals for enabled types %s; re-checking in %ds",
+                    sorted(enabled), _EMPTY_REFRESH_SECONDS,
+                )
         else:
             logger.warning("Tradetiq fetch failed — keeping stale cache")
 
