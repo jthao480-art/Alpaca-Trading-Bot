@@ -123,7 +123,7 @@ def check_wave_provisional(
     return None
 
 # ── Surge ──────────────────────────────────────────────────────────────────
-SURGE_MOMENTUM_THRESHOLD = 0.01  # up >= 1% from today's open
+SURGE_MOMENTUM_THRESHOLD = 0.02  # up >= 2% from today's open
 
 def check_surge(day_open: float, current_price: float) -> str | None:
     if day_open is None or current_price is None:
