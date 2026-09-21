@@ -157,7 +157,11 @@ class Bars_Service:
             "end": end,
             "limit": limit,
             "feed": feed,
-            "sort": "asc",
+            # Newest bars first: with sort=asc + start=14 days ago + a small limit, Alpaca
+            # returns the OLDEST `limit` bars of the window (stale data for every agent,
+            # the SPY trend filter and get_latest_price). The module-level get_bars()
+            # below reverses the result so callers still see oldest -> newest.
+            "sort": "desc",
         }
         key = ("bars", symbol, start, end, timeframe, limit, feed)
         return await self._get_with_retry(path, params=params, cache=self._bars_cache, cache_key=key)
@@ -187,7 +191,9 @@ def _default_window(days: int = 7) -> tuple[str, str]:
 async def get_bars(symbol, timeframe="5Min", limit=60, feed="iex"):
     start, end = _default_window(14)
     payload = await _service.get_bars(symbol, start, end, timeframe=timeframe, limit=limit, feed=feed)
-    return payload.get("bars", []) if isinstance(payload, dict) else []
+    bars = (payload.get("bars") or []) if isinstance(payload, dict) else []
+    # requested newest-first (see Bars_Service.get_bars); return oldest -> newest, latest bar last
+    return list(reversed(bars))
 
 
 async def get_latest_bar(symbol, timeframe="5Min", limit=1, feed="iex"):
