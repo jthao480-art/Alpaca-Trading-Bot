@@ -283,14 +283,24 @@ def build_exit_plan(signal: dict[str, Any], bars_held: int = 0, green_gain_pct: 
         tp, sl = 0.035, 0.015
     tighten_after_bars = _cfg_int("EXIT_TIGHTEN_AFTER_BARS", 3)
     tight_loss_stop_pct = _cfg_float("TIGHT_LOSS_STOP_PCT", 0.004)
-    trailing_stop_default = _cfg_float("TRAILING_STOP_PCT", 4.0)
     if bars_held >= tighten_after_bars and green_gain_pct <= 0.0:
         sl = min(sl, tight_loss_stop_pct)
+    # The trailing-stop percent now tracks this trade's own momentum-scaled
+    # stop_loss_pct instead of a flat TRAILING_STOP_PCT (previously defaulted
+    # to 4% regardless of the trade's actual risk tier). A signal sized as a
+    # tight 0.5% scalp was previously protected by a stop up to 8x wider than
+    # the risk it was scored on; the trailing stop now matches what was
+    # actually calculated. An optional TRAILING_STOP_PCT config value still
+    # acts as a ceiling, for anyone who wants a floor on how tight it can get.
+    trailing_stop_pct = round(sl * 100, 3)
+    trailing_stop_cap = _cfg_float("TRAILING_STOP_PCT", 0.0)
+    if trailing_stop_cap > 0:
+        trailing_stop_pct = min(trailing_stop_pct, trailing_stop_cap)
     return {
         "take_profit_pct": tp,
         "stop_loss_pct": sl,
         "use_trailing": True,
-        "trailing_stop_pct": trailing_stop_default,
+        "trailing_stop_pct": trailing_stop_pct,
     }
 
 
@@ -935,8 +945,8 @@ class botV3:
 
     async def _close_short_market(self, qty: float, symbol: str, ledger: Any) -> None:
         try:
-            from backend.execution import place_market_buy
-            order_id, _ = await place_market_buy(symbol, qty)
+            from backend.execution import place_market_cover
+            order_id = await place_market_cover(symbol, qty)
             if order_id:
                 close_entry(ledger, symbol=symbol, order_id=order_id, exit_price=None, reason="time_exit_cover", cooldown_minutes=self.cooldown_minutes)
                 _BOUGHT_THIS_SESSION.add(symbol)
@@ -1440,13 +1450,16 @@ class botV3:
             _PENDING_BUYS.add(symbol)
             _BOUGHT_THIS_SESSION.add(symbol)
             try:
+                _short_stop_loss_pct = 0.010
                 order_id, fill_price = await execution_place_bracket_short(
                     symbol=symbol,
                     qty=qty,
                     take_profit_pct=0.018,
-                    stop_loss_pct=0.010,
+                    stop_loss_pct=_short_stop_loss_pct,
                     use_trailing=True,
-                    trailing_stop_pct=4.0,
+                    # trail matches this trade's own stop_loss_pct (1.0%), not
+                    # a flat 4% — same fix as the long side in build_exit_plan.
+                    trailing_stop_pct=round(_short_stop_loss_pct * 100, 3),
                 )
             finally:
                 _PENDING_BUYS.discard(symbol)

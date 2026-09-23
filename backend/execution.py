@@ -683,12 +683,18 @@ async def place_bracket_buy(
     stop_loss_price = round(estimated_price * (1.0 - stop_loss_pct - 0.005), 2)
     stop_loss_price = min(stop_loss_price, round(estimated_price - 0.10, 2))
 
-    # Place plain market buy — no bracket legs
-    # Trailing stop will be attached after fill (more reliable than bracket)
+    # Place the entry as a real bracket order (parent + take-profit + stop-loss
+    # legs), same as place_bracket_short already does. Previously this called
+    # place_market_buy with take_profit_price=None, stop_loss_price=None, which
+    # submitted a bare market order with NO protection at all — the momentum-
+    # scaled stop/target computed above was never actually placed on Alpaca.
+    # A bracket order's legs share quantity by design (no 403 qty-conflict risk),
+    # and the position is protected from the instant it fills, including
+    # after-hours/overnight entries that previously sat naked until market open.
     order_id, filled_price = await place_market_buy(
         symbol, qty,
-        take_profit_price=None,
-        stop_loss_price=None,
+        take_profit_price=take_profit_price,
+        stop_loss_price=stop_loss_price,
     )
     if not order_id:
         return None, None
@@ -780,9 +786,11 @@ async def place_bracket_buy(
             logger.exception("Failed to attach trailing stop for %s", symbol)
 
     elif not _in_regular_hours:
-        # After hours: bracket legs (hard stop + take profit) stay active overnight.
-        # Queue a deferred trailing stop — at market open, attach_deferred_trailing_stops()
-        # will cancel the bracket legs and replace them with a trailing stop.
+        # After hours: real bracket legs (hard stop + take profit) are already
+        # live on Alpaca from the order above, so the position IS protected
+        # here. Queue a deferred trailing stop — at market open,
+        # attach_deferred_trailing_stops() will cancel the bracket legs and
+        # replace them with a trailing stop.
         if use_trailing and trailing_stop_pct > 0:
             _deferred_trailing_stops[symbol] = trailing_stop_pct
             _save_deferred_stops()
