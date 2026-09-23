@@ -587,11 +587,20 @@ class botV3:
                 and str(o.get("type", "")).lower() in ("trailing_stop", "stop", "limit")
             ]
             if active_exits:
-                logger.debug(
-                    "loser_sweep_skip symbol=%s reason=active_%s_exists",
-                    symbol, active_exits[0].get("type"),
+                # The -5% backstop is a last line of defense — it must fire even
+                # when a stop/trailing-stop order is already resting on this
+                # position, since the whole point is to catch cases where that
+                # order didn't do its job (gap-through, stuck/rejected order,
+                # API hiccup). Cancel it and sell at market now, same
+                # cancel-then-sell pattern used by the time exits and the
+                # momentum/volume-fade exit override.
+                logger.info(
+                    "loser_sweep for %s overriding active %s order (plpc=%.4f)",
+                    symbol, active_exits[0].get("type"), plpc,
                 )
-                continue
+                for o in active_exits:
+                    await _cancel_order_by_id(str(o.get("id", "")))
+                await asyncio.sleep(1.0)
             _PENDING_SELLS.add(symbol)
             try:
                 logger.info(
