@@ -1192,11 +1192,18 @@ class botV3:
                         and str(o.get("type", "")).lower() in ("trailing_stop", "stop", "limit")
                     ]
                     if active_exits:
-                        logger.debug(
-                            "Skipping market sell for %s — active %s order exists",
-                            symbol, active_exits[0].get("type"),
+                        # A genuine momentum/volume-fade signal overrides the standing
+                        # stop-loss / trailing-stop instead of waiting for price to reach
+                        # it — cancel it and sell at market now. Same cancel-then-sell
+                        # pattern _close_position_market already uses for the stagnant
+                        # and intraday time exits, which were never blocked by this check.
+                        logger.info(
+                            "Momentum exit for %s (%s) overriding active %s order",
+                            symbol, exit_reason, active_exits[0].get("type"),
                         )
-                        continue
+                        for o in active_exits:
+                            await _cancel_order_by_id(str(o.get("id", "")))
+                        await asyncio.sleep(1.0)
                     _PENDING_SELLS.add(symbol)
                     try:
                         order_id = await place_market_sell(symbol, open_qty)
