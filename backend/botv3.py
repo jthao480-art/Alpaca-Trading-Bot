@@ -53,6 +53,11 @@ _BOUGHT_THIS_SESSION: set[str] = set()
 _LAST_LOSER_SWEEP: datetime | None = None
 _FAILED_SELL_ATTEMPTS: dict[str, int] = {}
 _MAX_SELL_ATTEMPTS: int = 3
+# Grace period before _protect_positions will evaluate a just-opened position.
+# The exchange needs a moment to finish propagating a brand-new bracket
+# order's legs into its own "open orders" list; checking too soon can see a
+# stale/empty result and wrongly conclude the position has no protection.
+_PROTECT_GRACE_SECONDS: float = float(getattr(config, "PROTECT_GRACE_SECONDS", 45))
 
 MAX_POSITIONS = int(getattr(config, "MAX_POSITIONS", 150))
 DAILY_LOSS_LIMIT = float(getattr(config, "DAILY_LOSS_LIMIT", -2000))
@@ -856,20 +861,23 @@ class botV3:
                 qty = float(p.get("qty", 0))
                 if not symbol or qty == 0:
                     continue
+                _ledger = load_ledger()
+                _sym_entries = _ledger.get(symbol, [])
+                _sym_open_entry = None
+                if isinstance(_sym_entries, list):
+                    _sym_open_entry = next((e for e in reversed(_sym_entries) if e.get("status") == "open"), None)
+                _sym_strategy = _entry_kind(_sym_open_entry) if _sym_open_entry else ""
+                _is_long_hold = _sym_strategy in ("smarttiq", "nexus")
+                if _sym_open_entry:
+                    _entry_created = _from_iso(_sym_open_entry.get("created_at"))
+                    if _entry_created and (datetime.now(ET) - _entry_created).total_seconds() < _PROTECT_GRACE_SECONDS:
+                        continue
                 orders = await _get_open_orders_for_symbol(symbol)
                 order_types = [str(o.get("type", "")).lower() for o in orders]
                 order_sides = [str(o.get("side", "")).lower() for o in orders]
                 if qty > 0:
                     has_trailing = any(t == "trailing_stop" for t, s in zip(order_types, order_sides) if s == "sell")
                     has_hard_stop = any(t == "stop" for t, s in zip(order_types, order_sides) if s == "sell")
-                    _ledger = load_ledger()
-                    _sym_entries = _ledger.get(symbol, [])
-                    _sym_strategy = ""
-                    if isinstance(_sym_entries, list):
-                        _open = next((e for e in reversed(_sym_entries) if e.get("status") == "open"), None)
-                        if _open:
-                            _sym_strategy = _entry_kind(_open)
-                    _is_long_hold = _sym_strategy in ("smarttiq", "nexus")
                     if _is_long_hold and not has_hard_stop:
                         price = await get_latest_price(symbol)
                         if price:
