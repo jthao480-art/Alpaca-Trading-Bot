@@ -884,7 +884,7 @@ class botV3:
                                 "stop_price": str(stop_price),
                             })
                             logger.info("Long-hold %s — hard stop placed at %.2f (8%% below)", symbol, stop_price)
-                    if not has_trailing and not _is_long_hold:
+                    if not has_trailing and not has_hard_stop and not _is_long_hold:
                         logger.warning("Long %s — attempting trailing stop sell (has_hard_stop=%s)", symbol, has_hard_stop)
                         trail_id = await place_trailing_stop_sell(symbol, qty, trail_percent=5.0)
                         if trail_id:
@@ -913,7 +913,7 @@ class botV3:
                 elif qty < 0:
                     has_trailing = any(t == "trailing_stop" for t, s in zip(order_types, order_sides) if s == "buy")
                     has_hard_stop = any(t == "stop" for t, s in zip(order_types, order_sides) if s == "buy")
-                    if not has_trailing:
+                    if not has_trailing and not has_hard_stop:
                         logger.warning("Short %s — attempting trailing stop buy (has_hard_stop=%s)", symbol, has_hard_stop)
                         trail_id = await place_trailing_stop_buy(symbol, abs(qty), 4.0)
                         if trail_id:
