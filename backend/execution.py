@@ -1318,6 +1318,20 @@ async def monitor_hard_stops(poll_interval: int = HARD_STOP_POLL_INTERVAL):
     )
     while True:
         try:
+            if not _is_regular_market_hours():
+                # Plain market day-orders (what this monitor submits below)
+                # cannot fill outside 9:30-4:00 ET regardless of how many
+                # times we retry. Submitting one anyway just cancels it 30s
+                # later and resubmits, forever, with zero chance of success
+                # until the market reopens - pure API/order-log churn with
+                # no protective effect. Skip the attempt entirely; a
+                # triggering position picks right back up here the moment
+                # regular hours resume. (Whatever bracket/trailing stop was
+                # attached at entry is still the position's real overnight
+                # protection - this monitor is a same-hours backstop on
+                # top of that, not a substitute for it after-hours.)
+                await asyncio.sleep(poll_interval)
+                continue
             positions = await _get_open_positions()
             for pos in positions:
                 symbol = pos.get("symbol")
