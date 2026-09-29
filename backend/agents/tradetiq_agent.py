@@ -6,12 +6,21 @@ tradetiq_agent.py — Tradetiq curated signal agent.
 Calls /api/signals/todays-signals-bot ONCE per day and caches the result.
 Each symbol in the curated list is returned as a buy signal when analyzed.
 
-Individual signal types can be toggled via .env / Railway Variables:
-    USE_TRADETIQ_RIPPLE=true/false       (Ripple provisional, 5-day hold)
-    USE_TRADETIQ_ARES=true/false         (Ares provisional, 21-day hold)
-    USE_TRADETIQ_WAVE=true/false         (Wave provisional, 5-day hold)
-    USE_TRADETIQ_SMARTTIQ=true/false     (SmartTiq EOD, 21-day hold)
-    USE_TRADETIQ_NEXUS=true/false        (Nexus EOD, 35-day hold)
+Individual signal types can be toggled via .env / Railway Variables.
+EOD and provisional are independently controllable per family — each
+*_EOD / *_PROVISIONAL variable defaults to its family's bundled switch
+below, so setting only the bundled one still controls both sides:
+    USE_TRADETIQ_RIPPLE=true/false             (bundled Ripple switch — fallback default for both sides)
+    USE_TRADETIQ_RIPPLE_EOD=true/false         (Ripple EOD, 5-day hold)
+    USE_TRADETIQ_RIPPLE_PROVISIONAL=true/false (Ripple provisional, 5-day hold)
+    USE_TRADETIQ_ARES=true/false               (bundled Ares switch — fallback default for both sides)
+    USE_TRADETIQ_ARES_EOD=true/false           (Ares EOD, 21-day hold)
+    USE_TRADETIQ_ARES_PROVISIONAL=true/false   (Ares provisional, 21-day hold)
+    USE_TRADETIQ_WAVE=true/false               (bundled Wave switch — fallback default for both sides)
+    USE_TRADETIQ_WAVE_EOD=true/false           (Wave EOD, 5-day hold)
+    USE_TRADETIQ_WAVE_PROVISIONAL=true/false   (Wave provisional, 5-day hold)
+    USE_TRADETIQ_SMARTTIQ=true/false           (SmartTiq EOD, 21-day hold — no provisional variant)
+    USE_TRADETIQ_NEXUS=true/false              (Nexus EOD, 35-day hold — no provisional variant)
 
 Master switch:
     USE_TRADETIQ_AGENT=true/false
@@ -66,21 +75,24 @@ _CACHE_LOCK = asyncio.Lock()
 
 def _get_enabled_signal_types() -> set[str]:
     enabled = set()
-    # Each toggle controls its whole signal family — both the EOD (validated,
-    # prior-close) variant and the same-day provisional variant. Previously
-    # only the "*_provisional" string was ever added here, so the EOD loop
-    # below (which matches on the bare "ripple"/"wave"/"ares" key) could
-    # never find a hit and those EOD entries were silently dropped no matter
-    # what Tradetiq published or how these toggles were set.
-    if getattr(config, "USE_TRADETIQ_RIPPLE", True):
-        enabled.add("ripple_provisional")
+    # EOD and provisional are independently controlled per family. Each
+    # config value defaults to that family's bundled USE_TRADETIQ_* switch
+    # (see config.py), so an untouched deployment behaves exactly as before;
+    # setting the *_EOD/*_PROVISIONAL variable explicitly on Railway overrides
+    # just that side.
+    if getattr(config, "USE_TRADETIQ_RIPPLE_EOD", True):
         enabled.add("ripple")
-    if getattr(config, "USE_TRADETIQ_ARES", True):
-        enabled.add("ares_provisional")
+    if getattr(config, "USE_TRADETIQ_RIPPLE_PROVISIONAL", True):
+        enabled.add("ripple_provisional")
+    if getattr(config, "USE_TRADETIQ_ARES_EOD", True):
         enabled.add("ares")
-    if getattr(config, "USE_TRADETIQ_WAVE", True):
-        enabled.add("wave_provisional")
+    if getattr(config, "USE_TRADETIQ_ARES_PROVISIONAL", True):
+        enabled.add("ares_provisional")
+    if getattr(config, "USE_TRADETIQ_WAVE_EOD", True):
         enabled.add("wave")
+    if getattr(config, "USE_TRADETIQ_WAVE_PROVISIONAL", True):
+        enabled.add("wave_provisional")
+    # SmartTiq/Nexus have no provisional variant — EOD only.
     if getattr(config, "USE_TRADETIQ_SMARTTIQ", False):
         enabled.add("smarttiq")
     if getattr(config, "USE_TRADETIQ_NEXUS", False):
