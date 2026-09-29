@@ -31,6 +31,7 @@ from backend.execution import (
     _get_open_orders_for_symbol,
     _get_open_positions,
     _cancel_order_by_id,
+    _is_regular_market_hours,
 )
 from backend.services.bars_service import get_bars
 from backend.services.account_service import get_account_buying_power
@@ -555,6 +556,16 @@ class botV3:
 
     async def _liquidate_loser_sweep(self, ledger: Any) -> None:
         global _LAST_LOSER_SWEEP
+        if not _is_regular_market_hours():
+            # This sweep cancels the position's existing protective order
+            # (trailing stop / hard stop / limit) and replaces it with a
+            # plain market sell (time_in_force="day"). Outside 9:30-4:00 ET
+            # that market sell cannot fill, so firing here would only strip
+            # real, working protection for a sell that's doomed to fail —
+            # leaving the position naked until the next protect pass. Skip
+            # and let the resting order keep doing its job; this sweep
+            # picks the position back up the moment regular hours resume.
+            return
         _now = datetime.now(ET)
         if _LAST_LOSER_SWEEP is not None:
             elapsed = (_now - _LAST_LOSER_SWEEP).total_seconds()
@@ -860,6 +871,18 @@ class botV3:
                 logger.exception("end_of_day_sweep failed symbol=%s", getattr(p, "symbol", "unknown"))
 
     async def _protect_positions(self) -> None:
+        if not _is_regular_market_hours():
+            # A trailing stop or hard stop submitted here cannot fill until
+            # the next regular session (Alpaca RTH rule — same one already
+            # applied to monitor_hard_stops in execution.py). Submitting one
+            # anyway just creates a resting order that *looks* like
+            # protection in the order list but can't actually trigger
+            # overnight — a false sense of safety. Skip; whatever real,
+            # fillable protection is already resting (bracket leg, prior
+            # trailing stop) stays untouched, and any position that's
+            # genuinely unprotected gets picked up here the moment regular
+            # hours resume.
+            return
         try:
             positions = await _get_open_positions()
             for p in positions:
@@ -978,6 +1001,15 @@ class botV3:
             logger.exception("_close_short_market failed symbol=%s", symbol)
 
     async def _intraday_time_exit_pass(self, ledger: Any) -> None:
+        if not _is_regular_market_hours():
+            # Same reasoning as the loser sweep: every exit below cancels
+            # the position's resting protective order and replaces it with
+            # a market sell that can't fill outside 9:30-4:00 ET. Firing
+            # near/after close would strip working protection and leave the
+            # position unprotected overnight instead of actually closing it.
+            # Skip the whole pass; stagnant/time-exit positions are caught
+            # again the moment regular hours resume.
+            return
         try:
             positions = await _get_open_positions()
             pos_map = {p.get("symbol"): p for p in positions}
