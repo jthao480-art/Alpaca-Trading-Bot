@@ -51,6 +51,12 @@ _PENDING_SELLS: set[str] = set()
 _PENDING_BUYS: set[str] = set()
 _BOUGHT_THIS_SESSION: set[str] = set()
 _LAST_LOSER_SWEEP: datetime | None = None
+# Keeps Tradetiq buys balanced ~50/50 between EOD (validated, prior-close)
+# signals and same-day provisional signals over the course of a trading day,
+# instead of letting whichever type happens to score higher that cycle
+# dominate all of the day's Tradetiq-sourced capital. Reset each trading day
+# in run_once() alongside _BOUGHT_THIS_SESSION.
+_TRADETIQ_CATEGORY_COUNTS: dict[str, int] = {"eod": 0, "provisional": 0}
 _FAILED_SELL_ATTEMPTS: dict[str, int] = {}
 _MAX_SELL_ATTEMPTS: int = 3
 # Grace period before _protect_positions will evaluate a just-opened position.
@@ -1337,6 +1343,24 @@ class botV3:
             score = float(item["score"])
             confidence = float(item["confidence"])
             metadata = signal.get("metadata", {}) or {}
+            _is_tradetiq_buy = str(signal.get("agent", "")).lower() == "tradetiq"
+            _tradetiq_category = str(metadata.get("category", "")).lower() or (
+                "provisional" if str(metadata.get("signal_type", "")).lower().endswith("_provisional") else "eod"
+            )
+            if _is_tradetiq_buy:
+                _this_n = _TRADETIQ_CATEGORY_COUNTS.get(_tradetiq_category, 0)
+                _other_category = "provisional" if _tradetiq_category == "eod" else "eod"
+                _other_n = _TRADETIQ_CATEGORY_COUNTS.get(_other_category, 0)
+                # After 3:30 PM ET stop enforcing the balance — don't let an
+                # imbalance (e.g. one category having no candidates all day)
+                # leave capital uninvested near the close.
+                _near_close = _now_check >= _now_check.replace(hour=15, minute=30, second=0, microsecond=0)
+                if _this_n > _other_n and not _near_close:
+                    logger.info(
+                        "Deferring tradetiq %s buy for %s — category balance eod=%d provisional=%d",
+                        _tradetiq_category, symbol, _TRADETIQ_CATEGORY_COUNTS["eod"], _TRADETIQ_CATEGORY_COUNTS["provisional"],
+                    )
+                    continue
             price = await get_latest_price(symbol)
             if not price:
                 logger.info("Candidate %s dropped — no price", symbol)
@@ -1428,6 +1452,8 @@ class botV3:
                     },
                 )
                 logger.info("Long entry: %s qty=%d price=%.2f score=%.3f", symbol, qty, fill_price or price, score)
+                if _is_tradetiq_buy:
+                    _TRADETIQ_CATEGORY_COUNTS[_tradetiq_category] = _TRADETIQ_CATEGORY_COUNTS.get(_tradetiq_category, 0) + 1
                 from backend.health_check import record_buy
                 record_buy()
 
@@ -1517,6 +1543,8 @@ class botV3:
         if self._session_date is None or self._session_date != _now.date():
             self._session_date = _now.date()
             _BOUGHT_THIS_SESSION.clear()
+            _TRADETIQ_CATEGORY_COUNTS["eod"] = 0
+            _TRADETIQ_CATEGORY_COUNTS["provisional"] = 0
             logger.info("New trading day — cleared bought-this-session cache")
             from backend.health_check import reset_daily_counts
             reset_daily_counts()

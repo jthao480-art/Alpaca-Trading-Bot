@@ -66,12 +66,21 @@ _CACHE_LOCK = asyncio.Lock()
 
 def _get_enabled_signal_types() -> set[str]:
     enabled = set()
+    # Each toggle controls its whole signal family — both the EOD (validated,
+    # prior-close) variant and the same-day provisional variant. Previously
+    # only the "*_provisional" string was ever added here, so the EOD loop
+    # below (which matches on the bare "ripple"/"wave"/"ares" key) could
+    # never find a hit and those EOD entries were silently dropped no matter
+    # what Tradetiq published or how these toggles were set.
     if getattr(config, "USE_TRADETIQ_RIPPLE", True):
         enabled.add("ripple_provisional")
+        enabled.add("ripple")
     if getattr(config, "USE_TRADETIQ_ARES", True):
         enabled.add("ares_provisional")
+        enabled.add("ares")
     if getattr(config, "USE_TRADETIQ_WAVE", True):
         enabled.add("wave_provisional")
+        enabled.add("wave")
     if getattr(config, "USE_TRADETIQ_SMARTTIQ", False):
         enabled.add("smarttiq")
     if getattr(config, "USE_TRADETIQ_NEXUS", False):
@@ -125,6 +134,7 @@ def _build_symbol_map(data: dict, enabled: set[str]) -> dict[str, list[dict]]:
                 continue
             symbol_map.setdefault(symbol, []).append({
                 "signal_type": signal_type,
+                "category": "eod",
                 "quality_score": float(entry.get("quality_score", 0.5) or 0.5),
                 "risk_tag": str(entry.get("risk_tag", "Unknown")),
                 "label": str(entry.get("label", "Bullish")),
@@ -144,6 +154,7 @@ def _build_symbol_map(data: dict, enabled: set[str]) -> dict[str, list[dict]]:
                 continue
             symbol_map.setdefault(symbol, []).append({
                 "signal_type": signal_type,
+                "category": "provisional",
                 "quality_score": float(entry.get("quality_score", 0.5) or 0.5),
                 "risk_tag": str(entry.get("risk_tag", "Unknown")),
                 "label": str(entry.get("label", "Bullish")),
@@ -217,6 +228,7 @@ class TradetiqAgent(BaseAgent):
 
             best = max(signals, key=lambda x: x["quality_score"])
             signal_type = best["signal_type"]
+            category = best.get("category", "provisional")
             quality_score = best["quality_score"]
             risk_tag = best["risk_tag"]
             hold_days = _HOLD_DAYS.get(signal_type, 5)
@@ -244,6 +256,7 @@ class TradetiqAgent(BaseAgent):
                 metadata={
                     "tradetiq_active": True,
                     "signal_type": signal_type,
+                    "category": category,
                     "signal_types": signal_names,
                     "quality_score": quality_score,
                     "risk_tag": risk_tag,
