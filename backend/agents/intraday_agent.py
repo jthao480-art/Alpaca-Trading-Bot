@@ -22,6 +22,18 @@ against THESE EXACT conditions.
 Enable via .env:
   USE_INTRADAY_AGENT=true
   USE_DEFAULT_AGENTS=true  (or false to run intraday only)
+
+Each of the 4 checks above can also be individually toggled (all default
+true — an untouched deployment runs all four exactly as before):
+  USE_RIPPLE=true/false             (check 1: Ripple provisional)
+  USE_ARES_PROVISIONAL=true/false   (check 2: Ares Bullish provisional)
+  USE_WAVE_PROVISIONAL=true/false   (check 3: Wave provisional — local,
+                                      computed here from Alpaca bars; distinct
+                                      from Tradetiq's own API-sourced Wave
+                                      provisional signal in tradetiq_agent.py,
+                                      and distinct from the separate standalone
+                                      WaveAgent controlled by USE_WAVE_AGENT)
+  USE_SURGE=true/false              (check 4: Surge)
 """
 
 import asyncio
@@ -32,6 +44,7 @@ from typing import Any, Optional
 
 from backend.agents.base import BaseAgent
 from backend.services.bars_service import get_bars_cached as get_bars
+from backend import config
 
 ET = ZoneInfo("America/New_York")
 
@@ -242,28 +255,34 @@ class IntradayAgent(BaseAgent):
             trailing_vols = _get_trailing_volumes(symbol, current_hour)
             rel_vol = get_wave_relative_volume(today_volume, trailing_vols)
 
-            # ── Run all 4 checks ──
+            # ── Run all 4 checks — each individually toggleable via Railway
+            # Variables (USE_RIPPLE / USE_ARES_PROVISIONAL / USE_WAVE_PROVISIONAL /
+            # USE_SURGE), independent of USE_WAVE_AGENT (a separate, unrelated
+            # standalone WaveAgent) and independent of Tradetiq's own API-sourced
+            # wave_provisional signals (tradetiq_agent.py / USE_TRADETIQ_WAVE_PROVISIONAL).
+            # All four default to True, so an untouched deployment runs all four
+            # exactly as before. ──
             ripple = check_ripple_provisional(
                 regime_passed=regime_passed,
                 current_price=current_price,
                 prior_close=prior_close,
                 yesterday_down_streak=yesterday_down_streak,
-            )
+            ) if getattr(config, "USE_RIPPLE", True) else None
             ares = check_ares_bullish_provisional(
                 regime_passed=regime_passed,
                 current_price=current_price,
                 prior_close=prior_close,
                 yesterday_down_streak=yesterday_down_streak,
-            )
+            ) if getattr(config, "USE_ARES_PROVISIONAL", True) else None
             wave = check_wave_provisional(
                 day_open=today_open,
                 current_price=current_price,
                 relative_volume=rel_vol,
-            )
+            ) if getattr(config, "USE_WAVE_PROVISIONAL", True) else None
             surge = check_surge(
                 day_open=today_open,
                 current_price=current_price,
-            )
+            ) if getattr(config, "USE_SURGE", True) else None
 
             intraday_pct = (current_price - today_open) / today_open if today_open > 0 else 0.0
             prior_pct = (current_price - prior_close) / prior_close if prior_close > 0 else 0.0
