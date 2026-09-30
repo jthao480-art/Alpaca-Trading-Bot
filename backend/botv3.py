@@ -1155,8 +1155,18 @@ class botV3:
         logger.debug("handle_signals_start signals=%d open_positions=%d", len(signals), len(open_positions))
         await self._liquidate_loser_sweep(ledger)
         await self._intraday_time_exit_pass(ledger)
-        await self._session_exit_pass(ledger)
-        await self._end_of_day_sweep(ledger)
+        # _session_exit_pass (90-minute same-day timer) and _end_of_day_sweep
+        # (force-flatten anything opened today by close) are intentionally not
+        # called here. Both forced same-day exits regardless of signal type,
+        # which fought the actual hold-period design: each signal already gets
+        # its own hold window (5/21/35 trading days depending on
+        # ripple/wave / ares/tradetiq/smarttiq / nexus) via
+        # _intraday_time_exit_pass, protected the whole time by its resting
+        # trailing-stop/take-profit/stop-loss, with the stagnant-exit sub-rule
+        # (1-3 days depending on strategy) as the early-out for flat positions.
+        # The loser sweep above remains as the -5% hard backstop. The two
+        # functions are left defined below, unused, rather than deleted, in
+        # case they're wanted again.
         if not under_position_limit(self.trading_client):
             logger.info("handle_signals_stop reason=position_limit")
             save_ledger(ledger)
