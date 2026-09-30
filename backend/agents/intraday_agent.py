@@ -49,9 +49,11 @@ from backend import config
 ET = ZoneInfo("America/New_York")
 
 # ── Checkpoint window ──────────────────────────────────────────────────────
-# Only fire intraday signals between 12:30 PM and 3:00 PM ET
-# (matches Tradetiq's ~1pm ET checkpoint logic)
-_CHECKPOINT_START = time(12, 30)
+# Fire intraday signals from market open (9:30 AM ET) through 3:00 PM ET.
+# Originally started at 12:30 PM to match Tradetiq's own checkpoint logic,
+# but pre-market/after-market price action already moves these tickers by
+# the open, so waiting until midday missed real setups — moved to 9:30.
+_CHECKPOINT_START = time(9, 30)
 _CHECKPOINT_END = time(15, 0)
 
 # ── Regime filter ──────────────────────────────────────────────────────────
@@ -192,7 +194,7 @@ class IntradayAgent(BaseAgent):
         return IntradayAgent._spy_closes
 
     def _is_checkpoint_window(self) -> bool:
-        """Only fire signals between 12:30 PM and 3:00 PM ET."""
+        """Only fire signals between market open (9:30 AM ET) and 3:00 PM ET."""
         now = datetime.now(ET).time()
         return _CHECKPOINT_START <= now <= _CHECKPOINT_END
 
