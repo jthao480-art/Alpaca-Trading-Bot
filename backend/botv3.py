@@ -305,6 +305,14 @@ def build_exit_plan(signal: dict[str, Any], bars_held: int = 0, green_gain_pct: 
     # actually calculated. An optional TRAILING_STOP_PCT config value still
     # acts as a ceiling, for anyone who wants a floor on how tight it can get.
     trailing_stop_pct = round(sl * 100, 3)
+    # Low-momentum signals land at 0.5%, which is inside normal bid-ask noise
+    # for a volatile ticker and gets stopped out almost instantly regardless
+    # of whether the signal's direction call was correct (observed on CBRX:
+    # a 70-second round trip on a stock that had just dropped 13.8% the prior
+    # day). Floor keeps weak signals cut fast without being noise-sensitive.
+    trailing_stop_floor = _cfg_float("TRAILING_STOP_FLOOR_PCT", 1.0)
+    if trailing_stop_floor > 0:
+        trailing_stop_pct = max(trailing_stop_pct, trailing_stop_floor)
     trailing_stop_cap = _cfg_float("TRAILING_STOP_PCT", 0.0)
     if trailing_stop_cap > 0:
         trailing_stop_pct = min(trailing_stop_pct, trailing_stop_cap)

@@ -38,6 +38,13 @@ DAILY_LOSS_LIMIT_USD = float(_env.get("DAILY_LOSS_LIMIT_USD", "2000.0"))
 DAILY_LOSS_LIMIT = -float(_env.get("DAILY_LOSS_LIMIT_USD", "2000.0"))
 MIN_CASH_RESERVE = float(_env.get("MIN_CASH_RESERVE", "0.0"))
 HARD_STOP_TRIGGER_PCT = float(_env.get("HARD_STOP_TRIGGER_PCT", "-0.055"))
+# Floor (in percent, e.g. 1.0 = 1%) under which a trade's trailing stop can
+# never be set, regardless of how tight its momentum-scaled stop_loss_pct is
+# (see build_exit_plan in botv3.py). Low-momentum signals were getting a
+# trailing stop as tight as 0.5%, which is within normal bid-ask noise for a
+# volatile ticker and gets clipped almost immediately regardless of whether
+# the signal's direction was right. Set to 0 to disable the floor.
+TRAILING_STOP_FLOOR_PCT = float(_env.get("TRAILING_STOP_FLOOR_PCT", "1.0"))
 SESSION_FLATTEN_TIME = _env.get("SESSION_FLATTEN_TIME", "15:45")
 USE_ALL_TRADABLE = _env.get("USE_ALL_TRADABLE", "false").lower() == "true"
 MAX_LEVERAGE = float(_env.get("MAX_LEVERAGE", "1.5"))
