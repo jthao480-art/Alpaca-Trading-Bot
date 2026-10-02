@@ -45,6 +45,23 @@ HARD_STOP_TRIGGER_PCT = float(_env.get("HARD_STOP_TRIGGER_PCT", "-0.055"))
 # volatile ticker and gets clipped almost immediately regardless of whether
 # the signal's direction was right. Set to 0 to disable the floor.
 TRAILING_STOP_FLOOR_PCT = float(_env.get("TRAILING_STOP_FLOOR_PCT", "1.0"))
+# Minimum trade_priority-score edge a new candidate must have over the open
+# position with the LOWEST stored priority score before the bot will sell
+# that position early to free a slot once MAX_POSITIONS is reached. Keeps
+# rotation reserved for a clearly better signal instead of firing on any
+# marginal edge, which would just add round-trip slippage. 0 rotates on any
+# improvement at all.
+ROTATION_PRIORITY_MARGIN = float(_env.get("ROTATION_PRIORITY_MARGIN", "0.15"))
+# A held position already up more than this (unrealized P&L %, e.g. 0.015 =
+# 1.5%) is never a rotation target, even if it has the lowest stored
+# priority score. A stale, low entry-time score isn't a reason to cut a
+# position that's actually working — its own take-profit/trailing-stop
+# stays in charge of that exit.
+ROTATION_MAX_WINNER_PLPC = float(_env.get("ROTATION_MAX_WINNER_PLPC", "0.015"))
+# Caps how many existing positions can be rotated out in a single scan cycle
+# once the book is full, so one cycle can't unwind a large chunk of the
+# portfolio chasing whatever signals happen to fire that pass.
+MAX_ROTATIONS_PER_CYCLE = int(_env.get("MAX_ROTATIONS_PER_CYCLE", "2"))
 SESSION_FLATTEN_TIME = _env.get("SESSION_FLATTEN_TIME", "15:45")
 USE_ALL_TRADABLE = _env.get("USE_ALL_TRADABLE", "false").lower() == "true"
 MAX_LEVERAGE = float(_env.get("MAX_LEVERAGE", "1.5"))

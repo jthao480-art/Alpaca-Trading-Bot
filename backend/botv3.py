@@ -669,6 +669,106 @@ class botV3:
             finally:
                 _PENDING_SELLS.discard(symbol)
 
+    async def _rotate_weakest_position(
+        self, ledger: Any, new_priority: float, margin: float,
+    ) -> str | None:
+        """
+        Called only when the book is already at MAX_POSITIONS and a ranked
+        candidate (see trade_priority / candidates.sort in _handle_signals)
+        is ready to buy. Finds the open long position with the lowest
+        trade_priority score recorded at its own entry and, if the new
+        candidate beats it by at least `margin`, sells it at market to free
+        a slot. Positions already up more than ROTATION_MAX_WINNER_PLPC are
+        never rotation targets — a stale, low entry-time priority score
+        isn't a reason to cut a position that's actually working; its own
+        take-profit/trailing-stop stays in charge of that exit. Long-hold
+        positions (smarttiq/nexus) are excluded too — their exit plan
+        assumes a multi-week hold, not a same-cycle swap. Returns the
+        rotated-out symbol, or None if nothing was rotated.
+        """
+        if not _is_regular_market_hours():
+            # Same reasoning as every other sell path here: a market sell
+            # submitted outside 9:30-4:00 ET can't fill, so rotating now
+            # would strip a resting stop/trailing-stop for a sell that's
+            # doomed to fail. Skip; the cap just stays enforced (no new buy)
+            # until regular hours resume.
+            return None
+        positions = self._load_position_objects()
+        if not positions:
+            return None
+        max_winner_plpc = _cfg_float("ROTATION_MAX_WINNER_PLPC", 0.015)
+        weakest: tuple[float, str, Any, float] | None = None
+        for p in positions:
+            symbol = getattr(p, "symbol", "")
+            qty = float(getattr(p, "qty", 0) or 0)
+            if not symbol or qty <= 0:
+                continue  # shorts aren't rotation targets
+            if symbol in _PENDING_SELLS or symbol in _PENDING_BUYS:
+                continue
+            plpc = self._position_unrealized_plpc(p)
+            if plpc is not None and plpc > max_winner_plpc:
+                continue
+            entries = ledger.get(symbol, [])
+            open_entry = (
+                next((e for e in reversed(entries) if e.get("status") == "open"), None)
+                if isinstance(entries, list) else None
+            )
+            if _entry_kind(open_entry) in _LONG_HOLD_KINDS:
+                continue
+            held_priority = float(((open_entry or {}).get("metadata", {}) or {}).get("priority", 0.0) or 0.0)
+            if weakest is None or held_priority < weakest[0]:
+                weakest = (held_priority, symbol, p, qty)
+        if weakest is None:
+            return None
+        held_priority, symbol, p, qty = weakest
+        if new_priority < held_priority + margin:
+            logger.debug(
+                "rotation_skip weakest=%s held_priority=%.3f candidate_priority=%.3f margin=%.3f",
+                symbol, held_priority, new_priority, margin,
+            )
+            return None
+        existing_orders = await _get_open_orders_for_symbol(symbol)
+        active_exits = [
+            o for o in existing_orders
+            if str(o.get("side", "")).lower() == "sell"
+            and str(o.get("status", "")).lower() in ("new", "held", "accepted")
+            and str(o.get("type", "")).lower() in ("trailing_stop", "stop", "limit")
+        ]
+        if active_exits:
+            for o in active_exits:
+                await _cancel_order_by_id(str(o.get("id", "")))
+            await asyncio.sleep(1.0)
+        _PENDING_SELLS.add(symbol)
+        try:
+            order_id = await place_market_sell(symbol, qty)
+            if not order_id:
+                logger.warning("rotation_sell_failed symbol=%s qty=%.4f", symbol, qty)
+                return None
+            fill_price = None
+            try:
+                fill_price = float(getattr(p, "current_price", None) or 0) or None
+            except Exception:
+                pass
+            close_entry(
+                ledger,
+                symbol=symbol,
+                order_id=order_id,
+                exit_price=fill_price,
+                reason="priority_rotation",
+                cooldown_minutes=self.cooldown_minutes,
+            )
+            _BOUGHT_THIS_SESSION.add(symbol)
+            logger.info(
+                "priority_rotation symbol=%s held_priority=%.3f replaced_by_priority=%.3f",
+                symbol, held_priority, new_priority,
+            )
+            return symbol
+        except Exception:
+            logger.exception("rotation_sell_exception symbol=%s qty=%.4f", symbol, qty)
+            return None
+        finally:
+            _PENDING_SELLS.discard(symbol)
+
     async def submit_order(self, **kwargs):
         try:
             return await execution_place_bracket_buy(**kwargs)
@@ -1381,7 +1481,32 @@ class botV3:
             len(signals), _dirs, len(candidates), len(short_candidates), spy_trend_up, _skips or "{}",
         )
 
-        # Process long candidates — only during entry hours
+        # Rank candidates best-first by trade_priority (the momentum/
+        # confidence/score/volume composite computed above) instead of
+        # executing them in whatever order the scanner happened to reach
+        # them in. This score was computed per-candidate all along but never
+        # used to order the buy loop below, so a weak signal scanned early
+        # could claim a slot a stronger signal scanned later never got a
+        # chance at.
+        candidates.sort(key=lambda c: float(c.get("priority", 0.0) or 0.0), reverse=True)
+
+        # Running count of open positions, checked before every buy below
+        # instead of only once at the top of _handle_signals. Previously
+        # only the one under_position_limit() check at the very start gated
+        # entries, so nothing stopped this loop from blowing well past
+        # MAX_POSITIONS within a single cycle (observed: 41 open positions
+        # against a 25 cap). Once the cap is hit, _rotate_weakest_position
+        # can still free a slot for a clearly better-ranked candidate.
+        _max_positions = int(getattr(config, "MAX_POSITIONS", 25) or 25)
+        try:
+            _open_position_count = len(self.trading_client.get_all_positions())
+        except Exception:
+            _open_position_count = len(open_positions)
+        _rotations_this_cycle = 0
+        _max_rotations_per_cycle = _cfg_int("MAX_ROTATIONS_PER_CYCLE", 2)
+        _rotation_margin = _cfg_float("ROTATION_PRIORITY_MARGIN", 0.15)
+
+        # Process long candidates, best priority first — only during entry hours
         for item in candidates:
             _now_check = datetime.now(ET)
             _allow_new_entries = _now_check.replace(hour=9, minute=30) <= _now_check <= _now_check.replace(hour=16, minute=0)
@@ -1392,6 +1517,7 @@ class botV3:
             symbol = item["symbol"]
             score = float(item["score"])
             confidence = float(item["confidence"])
+            priority = float(item.get("priority", 0.0) or 0.0)
             metadata = signal.get("metadata", {}) or {}
             _is_tradetiq_buy = str(signal.get("agent", "")).lower() == "tradetiq"
             _tradetiq_category = str(metadata.get("category", "")).lower() or (
@@ -1446,6 +1572,26 @@ class botV3:
                     "Candidate %s dropped — qty<1 (allowed=$%.2f price=$%.2f)", symbol, allowed_dollars, float(price),
                 )
                 continue
+            if _open_position_count >= _max_positions:
+                if _rotations_this_cycle >= _max_rotations_per_cycle:
+                    logger.info(
+                        "Candidate %s dropped — position cap reached (%d/%d) and rotation limit hit this cycle",
+                        symbol, _open_position_count, _max_positions,
+                    )
+                    continue
+                rotated_symbol = await self._rotate_weakest_position(ledger, priority, _rotation_margin)
+                if not rotated_symbol:
+                    logger.info(
+                        "Candidate %s dropped — position cap reached (%d/%d), no weaker holding to rotate out",
+                        symbol, _open_position_count, _max_positions,
+                    )
+                    continue
+                _rotations_this_cycle += 1
+                _open_position_count -= 1
+                logger.info(
+                    "Rotated out %s to make room for higher-priority candidate %s (priority %.3f)",
+                    rotated_symbol, symbol, priority,
+                )
             exit_plan = build_exit_plan(signal)
             _PENDING_BUYS.add(symbol)
             _BOUGHT_THIS_SESSION.add(symbol)
@@ -1472,6 +1618,7 @@ class botV3:
                     cooldown_minutes=self.cooldown_minutes,
                     metadata={
                         "score": score,
+                        "priority": priority,
                         "momentum_score": momentum_score,
                         "size_multiplier": mult,
                         "confidence": confidence,
@@ -1502,6 +1649,7 @@ class botV3:
                     },
                 )
                 logger.info("Long entry: %s qty=%d price=%.2f score=%.3f", symbol, qty, fill_price or price, score)
+                _open_position_count += 1
                 if _is_tradetiq_buy:
                     _TRADETIQ_CATEGORY_COUNTS[_tradetiq_category] = _TRADETIQ_CATEGORY_COUNTS.get(_tradetiq_category, 0) + 1
                 from backend.health_check import record_buy
