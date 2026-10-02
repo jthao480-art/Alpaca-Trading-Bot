@@ -193,6 +193,30 @@ def _cfg_any_float(*names: str, default: float = 0.0) -> float:
     return float(default)
 
 
+def _ratchet_tiers() -> list[tuple[float, float]]:
+    """
+    Parses TRAILING_STOP_RATCHET ("gain1:trail1,gain2:trail2,...") into a
+    list of (gain_threshold, trail_pct) pairs sorted by gain threshold. See
+    the config comment for the full rationale. Malformed entries are
+    skipped rather than raising, since this runs on every protect pass.
+    """
+    raw = str(getattr(config, "TRAILING_STOP_RATCHET", "") or "").strip()
+    if not raw:
+        return []
+    tiers: list[tuple[float, float]] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        gain_str, _, trail_str = part.partition(":")
+        try:
+            tiers.append((float(gain_str), float(trail_str)))
+        except ValueError:
+            continue
+    tiers.sort(key=lambda t: t[0])
+    return tiers
+
+
 def compute_momentum_score(signal: dict[str, Any]) -> float:
     metadata = signal.get("metadata", {}) or {}
     base_score = float(signal.get("score", 0.0) or 0.0)
@@ -1087,6 +1111,97 @@ class botV3:
         except Exception:
             logger.exception("_protect_positions failed")
 
+    async def _ratchet_trailing_stops(self) -> None:
+        """
+        "Let it run": widens a long position's resting trailing stop once
+        it's actually up by enough to earn more room, instead of leaving it
+        pinned at the tight momentum-scaled width it started with (see
+        build_exit_plan / TRAILING_STOP_FLOOR_PCT). That starting width is
+        sized for the signal's risk AT ENTRY and never adjusted for how the
+        trade performed afterward, so a position that took off was cut on
+        the same small pullback that would've stopped out a signal that
+        went nowhere. This only ever widens a stop (see TRAILING_STOP_RATCHET
+        in config.py), never tightens one, and never touches a flat or
+        losing position. The position's own hold-period exit
+        (_intraday_time_exit_pass), the volume-fade/sell-signal override,
+        and the -5% loser-sweep backstop are all untouched and can still
+        close it regardless of this.
+        """
+        if not _is_regular_market_hours():
+            # A replacement trailing stop submitted here can't fill outside
+            # 9:30-4:00 ET either — same reasoning as every other sell path
+            # in this file.
+            return
+        tiers = _ratchet_tiers()
+        if not tiers:
+            return
+        try:
+            positions = await _get_open_positions()
+        except Exception:
+            logger.exception("_ratchet_trailing_stops: failed to fetch positions")
+            return
+        if not positions:
+            return
+        ledger = load_ledger()
+        for p in positions:
+            symbol = p.get("symbol")
+            qty = float(p.get("qty", 0) or 0)
+            if not symbol or qty <= 0:
+                continue  # long side only for now — shorts aren't covered by this ratchet
+            if symbol in _PENDING_SELLS or symbol in _PENDING_BUYS:
+                continue
+            try:
+                plpc = float(p.get("unrealized_plpc", 0) or 0)
+            except Exception:
+                continue
+            entries = ledger.get(symbol, [])
+            open_entry = (
+                next((e for e in reversed(entries) if e.get("status") == "open"), None)
+                if isinstance(entries, list) else None
+            )
+            if _entry_kind(open_entry) in _LONG_HOLD_KINDS:
+                continue  # smarttiq/nexus use a hard stop, not a trailing stop
+            meta = (open_entry or {}).get("metadata", {}) or {}
+            current_trail = float(meta.get("ratchet_trail_pct") or meta.get("trailing_stop_pct") or 0.0)
+            target_trail = current_trail
+            for gain_threshold, trail_width in tiers:
+                if plpc >= gain_threshold and trail_width > target_trail:
+                    target_trail = trail_width
+            if target_trail <= current_trail:
+                continue  # hasn't earned a wider stop than it already has
+            orders = await _get_open_orders_for_symbol(symbol)
+            trailing_orders = [
+                o for o in orders
+                if str(o.get("side", "")).lower() == "sell"
+                and str(o.get("type", "")).lower() == "trailing_stop"
+                and str(o.get("status", "")).lower() not in ("filled", "canceled", "rejected", "expired")
+            ]
+            if not trailing_orders:
+                # Nothing resting to widen — _protect_positions handles
+                # attaching one in the first place.
+                continue
+            for o in trailing_orders:
+                await _cancel_order_by_id(str(o.get("id", "")))
+            await asyncio.sleep(1.0)
+            try:
+                new_trail_id = await place_trailing_stop_sell(symbol, qty, target_trail)
+            except Exception:
+                logger.exception("ratchet_widen_exception symbol=%s target=%.2f%%", symbol, target_trail)
+                continue
+            if new_trail_id:
+                if open_entry is not None:
+                    open_entry.setdefault("metadata", {})["ratchet_trail_pct"] = target_trail
+                    save_ledger(ledger)
+                logger.info(
+                    "ratchet_widen symbol=%s unrealized_plpc=%.4f %.2f%%->%.2f%% order=%s",
+                    symbol, plpc, current_trail, target_trail, new_trail_id,
+                )
+            else:
+                logger.warning(
+                    "ratchet_widen_failed symbol=%s unrealized_plpc=%.4f target=%.2f%% — position left on prior stop",
+                    symbol, plpc, target_trail,
+                )
+
     def _count_trading_days(self, start: datetime, end: datetime) -> int:
         count = 0
         current = start.date()
@@ -1764,6 +1879,7 @@ class botV3:
                 logger.exception("batch_failed start=%s size=%s", i, len(batch))
             if i > 0 and (i // self.batch_size) % 20 == 0:
                 await self._protect_positions()
+                await self._ratchet_trailing_stops()
         _now_et = datetime.now(ET)
         _market_open = _now_et.replace(hour=9, minute=30, second=0, microsecond=0)
         _entry_cutoff = _now_et.replace(hour=16, minute=0, second=0, microsecond=0)
@@ -1778,6 +1894,7 @@ class botV3:
         elif all_signals and not _within_hours:
             logger.info("Skipping signal processing — outside market hours (%s ET)", _now_et.strftime("%H:%M"))
         await self._protect_positions()
+        await self._ratchet_trailing_stops()
         return {
             "paper_only": paper_only,
             "signals": all_signals,

@@ -62,6 +62,22 @@ ROTATION_MAX_WINNER_PLPC = float(_env.get("ROTATION_MAX_WINNER_PLPC", "0.015"))
 # once the book is full, so one cycle can't unwind a large chunk of the
 # portfolio chasing whatever signals happen to fire that pass.
 MAX_ROTATIONS_PER_CYCLE = int(_env.get("MAX_ROTATIONS_PER_CYCLE", "2"))
+# "Let it run" trailing-stop ratchet. A position's trailing stop starts at
+# the tight momentum-scaled width from build_exit_plan (0.5-1.5%, floored by
+# TRAILING_STOP_FLOOR_PCT) — sized for the signal's risk AT ENTRY, and it
+# never adjusted for how the trade actually performed afterward, so a
+# position that took off got cut on the same small pullback that would've
+# stopped out a signal that went nowhere. Once unrealized gain crosses one
+# of these thresholds, the trailing stop widens to the paired percentage
+# instead of staying pinned at its starting width — a proven runner gets
+# more room, while a flat or losing position is left untouched. Format:
+# "gain1:trail1,gain2:trail2,..." (gain as a fraction, e.g. 0.03 = 3%; trail
+# as a percent, e.g. 2.0 = 2.0%). Each trail stays well under its gain
+# threshold so even a full pullback to the new stop still locks in real
+# profit — this only ever widens a stop, never tightens one. The position's
+# own hold-period exit and volume-fade exit are untouched by this and can
+# still close it regardless. Set to "" to disable.
+TRAILING_STOP_RATCHET = _env.get("TRAILING_STOP_RATCHET", "0.03:2.0,0.06:3.5,0.10:5.0")
 SESSION_FLATTEN_TIME = _env.get("SESSION_FLATTEN_TIME", "15:45")
 USE_ALL_TRADABLE = _env.get("USE_ALL_TRADABLE", "false").lower() == "true"
 MAX_LEVERAGE = float(_env.get("MAX_LEVERAGE", "1.5"))
