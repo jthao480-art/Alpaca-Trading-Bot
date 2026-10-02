@@ -614,8 +614,10 @@ class botV3:
             symbol = getattr(p, "symbol", "")
             qty = float(getattr(p, "qty", 0) or 0)
             plpc = self._position_unrealized_plpc(p)
-            if not symbol or qty <= 0:
-                continue
+            if not symbol or qty == 0:
+                continue  # covers both longs and shorts — Alpaca reports
+                # unrealized_plpc positive-for-winning on either side, so
+                # the -5% threshold below means the same thing regardless
             if plpc is None:
                 continue
             candidates.append((plpc, p))
@@ -623,6 +625,7 @@ class botV3:
         for plpc, p in candidates:
             symbol = getattr(p, "symbol", "")
             qty = float(getattr(p, "qty", 0) or 0)
+            is_short = qty < 0
             if plpc > LOSER_EXIT_THRESHOLD:
                 continue
             if symbol in _PENDING_SELLS:
@@ -633,10 +636,14 @@ class botV3:
             in_cooldown, cooldown_until = is_in_cooldown(ledger, symbol)
             if in_cooldown:
                 continue
+            # Longs are protected by a resting SELL order; shorts by a
+            # resting BUY order (covers the short). Match the side that
+            # actually applies to this position.
+            match_side = "buy" if is_short else "sell"
             existing_orders = await _get_open_orders_for_symbol(symbol)
             active_exits = [
                 o for o in existing_orders
-                if str(o.get("side", "")).lower() == "sell"
+                if str(o.get("side", "")).lower() == match_side
                 and str(o.get("status", "")).lower() in ("new", "held", "accepted")
                 and str(o.get("type", "")).lower() in ("trailing_stop", "stop", "limit")
             ]
@@ -645,8 +652,8 @@ class botV3:
                 # when a stop/trailing-stop order is already resting on this
                 # position, since the whole point is to catch cases where that
                 # order didn't do its job (gap-through, stuck/rejected order,
-                # API hiccup). Cancel it and sell at market now, same
-                # cancel-then-sell pattern used by the time exits and the
+                # API hiccup). Cancel it and sell/cover at market now, same
+                # cancel-then-close pattern used by the time exits and the
                 # momentum/volume-fade exit override.
                 logger.info(
                     "loser_sweep for %s overriding active %s order (plpc=%.4f)",
@@ -658,10 +665,14 @@ class botV3:
             _PENDING_SELLS.add(symbol)
             try:
                 logger.info(
-                    "loser_sweep_sell symbol=%s qty=%.4f unrealized_plpc=%.6f",
-                    symbol, qty, plpc,
+                    "loser_sweep_%s symbol=%s qty=%.4f unrealized_plpc=%.6f",
+                    "cover" if is_short else "sell", symbol, qty, plpc,
                 )
-                order_id = await place_market_sell(symbol, qty)
+                if is_short:
+                    from backend.execution import place_market_cover
+                    order_id = await place_market_cover(symbol, abs(qty))
+                else:
+                    order_id = await place_market_sell(symbol, qty)
                 if order_id:
                     fill_price = None
                     try:
@@ -1113,8 +1124,8 @@ class botV3:
 
     async def _ratchet_trailing_stops(self) -> None:
         """
-        "Let it run": widens a position's resting trailing stop once it's
-        actually up by enough to earn more room, instead of leaving it
+        "Let it run": widens a long position's resting trailing stop once
+        it's actually up by enough to earn more room, instead of leaving it
         pinned at the tight momentum-scaled width it started with (see
         build_exit_plan / TRAILING_STOP_FLOOR_PCT). That starting width is
         sized for the signal's risk AT ENTRY and never adjusted for how the
@@ -1122,15 +1133,10 @@ class botV3:
         the same small pullback that would've stopped out a signal that
         went nowhere. This only ever widens a stop (see TRAILING_STOP_RATCHET
         in config.py), never tightens one, and never touches a flat or
-        losing position. Covers both longs (widens the resting sell-side
-        trailing stop) and shorts (widens the resting buy-side trailing
-        stop that covers it) — Alpaca reports unrealized_plpc positive for
-        a winning position on either side, so the same tier math applies
-        unchanged. The position's own hold-period exit
-        (_intraday_time_exit_pass) is untouched and can still close it
-        regardless of this; the -5% loser-sweep backstop and the volume-
-        fade/sell-signal override currently only act on longs (a separate,
-        known gap — not something this method changes).
+        losing position. The position's own hold-period exit
+        (_intraday_time_exit_pass), the volume-fade/sell-signal override,
+        and the -5% loser-sweep backstop are all untouched and can still
+        close it regardless of this.
         """
         if not _is_regular_market_hours():
             # A replacement trailing stop submitted here can't fill outside
@@ -1151,9 +1157,8 @@ class botV3:
         for p in positions:
             symbol = p.get("symbol")
             qty = float(p.get("qty", 0) or 0)
-            if not symbol or qty == 0:
-                continue
-            is_short = qty < 0
+            if not symbol or qty <= 0:
+                continue  # long side only for now — shorts aren't covered by this ratchet
             if symbol in _PENDING_SELLS or symbol in _PENDING_BUYS:
                 continue
             try:
@@ -1175,14 +1180,10 @@ class botV3:
                     target_trail = trail_width
             if target_trail <= current_trail:
                 continue  # hasn't earned a wider stop than it already has
-            # Longs are protected by a resting SELL trailing stop; shorts by
-            # a resting BUY trailing stop (covers the short). Match the side
-            # that actually applies to this position.
-            match_side = "buy" if is_short else "sell"
             orders = await _get_open_orders_for_symbol(symbol)
             trailing_orders = [
                 o for o in orders
-                if str(o.get("side", "")).lower() == match_side
+                if str(o.get("side", "")).lower() == "sell"
                 and str(o.get("type", "")).lower() == "trailing_stop"
                 and str(o.get("status", "")).lower() not in ("filled", "canceled", "rejected", "expired")
             ]
@@ -1194,10 +1195,7 @@ class botV3:
                 await _cancel_order_by_id(str(o.get("id", "")))
             await asyncio.sleep(1.0)
             try:
-                if is_short:
-                    new_trail_id = await place_trailing_stop_buy(symbol, abs(qty), target_trail)
-                else:
-                    new_trail_id = await place_trailing_stop_sell(symbol, qty, target_trail)
+                new_trail_id = await place_trailing_stop_sell(symbol, qty, target_trail)
             except Exception:
                 logger.exception("ratchet_widen_exception symbol=%s target=%.2f%%", symbol, target_trail)
                 continue
@@ -1206,13 +1204,13 @@ class botV3:
                     open_entry.setdefault("metadata", {})["ratchet_trail_pct"] = target_trail
                     save_ledger(ledger)
                 logger.info(
-                    "ratchet_widen symbol=%s side=%s unrealized_plpc=%.4f %.2f%%->%.2f%% order=%s",
-                    symbol, "short" if is_short else "long", plpc, current_trail, target_trail, new_trail_id,
+                    "ratchet_widen symbol=%s unrealized_plpc=%.4f %.2f%%->%.2f%% order=%s",
+                    symbol, plpc, current_trail, target_trail, new_trail_id,
                 )
             else:
                 logger.warning(
-                    "ratchet_widen_failed symbol=%s side=%s unrealized_plpc=%.4f target=%.2f%% — position left on prior stop",
-                    symbol, "short" if is_short else "long", plpc, target_trail,
+                    "ratchet_widen_failed symbol=%s unrealized_plpc=%.4f target=%.2f%% — position left on prior stop",
+                    symbol, plpc, target_trail,
                 )
 
     def _count_trading_days(self, start: datetime, end: datetime) -> int:
@@ -1521,7 +1519,61 @@ class botV3:
                         _PENDING_SELLS.discard(symbol)
                 continue
             if open_qty < 0:
-                continue  # short position open — skip buy signals
+                # Mirror of the open_qty > 0 block above, for shorts. The
+                # volume-fade checks are direction-agnostic as-is — fading
+                # volume means the move's conviction is drying up whichever
+                # way it's been running, same reason to cover a short as to
+                # exit a long. Only the signal-reversal check flips: a BUY
+                # signal is the reversal that matters against a short, not
+                # another sell.
+                _held_entries = ledger.get(symbol, [])
+                _held_open = (
+                    next((e for e in reversed(_held_entries) if e.get("status") == "open"), None)
+                    if isinstance(_held_entries, list) else None
+                )
+                if _entry_kind(_held_open) in _LONG_HOLD_KINDS:
+                    continue
+                exit_reason = None
+                _is_intraday = str(signal.get("agent", "")).lower() == "intraday"
+                _has_volume_data = bool(_vol_data) or "volume_ratio" in metadata
+                if not _is_intraday and _has_volume_data and volume_slope < 0:
+                    exit_reason = "volume_slope_negative"
+                elif not _is_intraday and _has_volume_data and volume_ratio < self.volume_ratio_exit:
+                    exit_reason = "volume_ratio_fade"
+                elif direction == "buy" and confidence >= 0.5:
+                    exit_reason = "buy_signal"
+                if exit_reason and symbol not in _PENDING_SELLS:
+                    existing_orders = await _get_open_orders_for_symbol(symbol)
+                    active_exits = [
+                        o for o in existing_orders
+                        if str(o.get("side", "")).lower() == "buy"
+                        and str(o.get("status", "")).lower() in ("new", "held", "accepted")
+                        and str(o.get("type", "")).lower() in ("trailing_stop", "stop", "limit")
+                    ]
+                    if active_exits:
+                        logger.info(
+                            "Momentum cover for %s (%s) overriding active %s order",
+                            symbol, exit_reason, active_exits[0].get("type"),
+                        )
+                        for o in active_exits:
+                            await _cancel_order_by_id(str(o.get("id", "")))
+                        await asyncio.sleep(1.0)
+                    _PENDING_SELLS.add(symbol)
+                    try:
+                        from backend.execution import place_market_cover
+                        order_id = await place_market_cover(symbol, abs(open_qty))
+                        if order_id:
+                            close_entry(
+                                ledger,
+                                symbol=symbol,
+                                order_id=order_id,
+                                exit_price=None,
+                                reason="volume_fade_exit" if exit_reason != "buy_signal" else "signal_exit",
+                                cooldown_minutes=self.cooldown_minutes,
+                            )
+                    finally:
+                        _PENDING_SELLS.discard(symbol)
+                continue
             if direction == "buy":
                 if score < max(0.62, self.early_entry_threshold):
                     _skip("score_below_threshold")
