@@ -768,20 +768,49 @@ async def place_bracket_buy(
                     _deferred_trailing_stops[symbol] = trailing_stop_pct
                     _save_deferred_stops()
             else:
-                trail_id = await place_trailing_stop_sell(symbol, filled_qty, trailing_stop_pct)
-                if trail_id:
-                    logger.info(
-                        "Regular hours buy %s — trailing stop attached trail=%.1f%% id=%s",
-                        symbol, trailing_stop_pct, trail_id,
-                    )
-                else:
+                # Retry a few times: right after a fill the positions/orders
+                # endpoints can lag (or rate-limit during a buy burst), and a
+                # single failed attempt used to leave the position with NO
+                # resting exit at all once the bracket legs were cancelled.
+                for attempt in range(3):
+                    trail_id = await place_trailing_stop_sell(symbol, filled_qty, trailing_stop_pct)
+                    if trail_id:
+                        logger.info(
+                            "Regular hours buy %s — trailing stop attached trail=%.1f%% id=%s attempt=%d",
+                            symbol, trailing_stop_pct, trail_id, attempt + 1,
+                        )
+                        break
                     logger.warning(
-                        "Trailing stop placement failed for %s — queued for market open",
+                        "Trailing stop attempt %d failed for %s — retrying in 3s",
+                        attempt + 1, symbol,
+                    )
+                    await asyncio.sleep(3.0)
+                if not trail_id:
+                    logger.warning(
+                        "Trailing stop placement failed for %s — placing hard stop as fallback, "
+                        "trailing queued for market open",
                         symbol,
                     )
                     if use_trailing and trailing_stop_pct > 0:
                         _deferred_trailing_stops[symbol] = trailing_stop_pct
                         _save_deferred_stops()
+                    # Never leave the position naked: put the bracket's own
+                    # stop-loss level back as a plain GTC stop.
+                    try:
+                        _fb = await _post_order({
+                            "symbol": symbol,
+                            "qty": str(int(filled_qty)),
+                            "side": "sell",
+                            "type": "stop",
+                            "time_in_force": "gtc",
+                            "stop_price": str(round(stop_loss_price, 2)),
+                        })
+                        if _fb:
+                            logger.info("Long %s — fallback stop loss placed at %.2f", symbol, stop_loss_price)
+                        else:
+                            logger.error("Long %s — UNPROTECTED: trailing stop and fallback stop both failed", symbol)
+                    except Exception:
+                        logger.exception("Long %s — fallback stop loss placement failed", symbol)
         except Exception:
             logger.exception("Failed to attach trailing stop for %s", symbol)
 

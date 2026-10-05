@@ -1013,6 +1013,115 @@ class botV3:
             except Exception:
                 logger.exception("end_of_day_sweep failed symbol=%s", getattr(p, "symbol", "unknown"))
 
+    async def _protect_one_position(self, p: dict[str, Any]) -> None:
+        """Ensure ONE open position has a resting stop. Split out of
+        _protect_positions so a failure on one symbol can't abort the whole
+        pass and leave every later symbol in the list unprotected."""
+        symbol = p.get("symbol")
+        qty = float(p.get("qty", 0))
+        if not symbol or qty == 0:
+            return
+        _ledger = load_ledger()
+        _sym_entries = _ledger.get(symbol, [])
+        _sym_open_entry = None
+        if isinstance(_sym_entries, list):
+            _sym_open_entry = next((e for e in reversed(_sym_entries) if e.get("status") == "open"), None)
+        _sym_strategy = _entry_kind(_sym_open_entry) if _sym_open_entry else ""
+        _is_long_hold = _sym_strategy in ("smarttiq", "nexus")
+        _entry_trail = 0.0
+        if _sym_open_entry:
+            try:
+                _entry_trail = float((_sym_open_entry.get("metadata") or {}).get("trailing_stop_pct") or 0.0)
+            except Exception:
+                _entry_trail = 0.0
+        if _entry_trail > 0:
+            _entry_trail = max(_entry_trail, _cfg_float("TRAILING_STOP_FLOOR_PCT", 1.0))
+        if _sym_open_entry:
+            _entry_created = _from_iso(_sym_open_entry.get("created_at"))
+            if _entry_created and (datetime.now(ET) - _entry_created).total_seconds() < _PROTECT_GRACE_SECONDS:
+                return
+        orders = await _get_open_orders_for_symbol(symbol)
+        order_types = [str(o.get("type", "")).lower() for o in orders]
+        order_sides = [str(o.get("side", "")).lower() for o in orders]
+        if qty > 0:
+            has_trailing = any(t == "trailing_stop" for t, s in zip(order_types, order_sides) if s == "sell")
+            has_hard_stop = any(t == "stop" for t, s in zip(order_types, order_sides) if s == "sell")
+            if _is_long_hold and not has_hard_stop:
+                price = await get_latest_price(symbol)
+                if price:
+                    stop_price = round(price * 0.92, 2)
+                    from backend.execution import _post_order
+                    await _post_order({
+                        "symbol": symbol,
+                        "qty": str(int(qty)),
+                        "side": "sell",
+                        "type": "stop",
+                        "time_in_force": "gtc",
+                        "stop_price": str(stop_price),
+                    })
+                    logger.info("Long-hold %s — hard stop placed at %.2f (8%% below)", symbol, stop_price)
+            if not has_trailing and not has_hard_stop and not _is_long_hold:
+                logger.warning("Long %s — attempting trailing stop sell (has_hard_stop=%s)", symbol, has_hard_stop)
+                trail_id = await place_trailing_stop_sell(symbol, qty, trail_percent=(_entry_trail or 5.0))
+                if trail_id:
+                    if has_hard_stop:
+                        for o in orders:
+                            if str(o.get("type", "")).lower() == "stop" and str(o.get("side", "")).lower() == "sell":
+                                await _cancel_order_by_id(str(o.get("id", "")))
+                                logger.info("Long %s — hard stop replaced by trailing stop", symbol)
+                else:
+                    if not has_hard_stop:
+                        price = await get_latest_price(symbol)
+                        if price:
+                            stop_price = round(price * 0.95, 2)
+                            from backend.execution import _post_order
+                            _fb = await _post_order({
+                                "symbol": symbol,
+                                "qty": str(int(qty)),
+                                "side": "sell",
+                                "type": "stop",
+                                "time_in_force": "gtc",
+                                "stop_price": str(stop_price),
+                            })
+                            if _fb:
+                                logger.warning("Long %s — hard stop fallback placed at %.2f", symbol, stop_price)
+                            else:
+                                logger.error("Long %s — UNPROTECTED: trailing stop AND hard stop fallback both failed (qty=%s)", symbol, qty)
+                    else:
+                        logger.warning("Long %s — trailing stop failed, hard stop still active", symbol)
+        elif qty < 0:
+            has_trailing = any(t == "trailing_stop" for t, s in zip(order_types, order_sides) if s == "buy")
+            has_hard_stop = any(t == "stop" for t, s in zip(order_types, order_sides) if s == "buy")
+            if not has_trailing and not has_hard_stop:
+                logger.warning("Short %s — attempting trailing stop buy (has_hard_stop=%s)", symbol, has_hard_stop)
+                trail_id = await place_trailing_stop_buy(symbol, abs(qty), (_entry_trail or 4.0))
+                if trail_id:
+                    if has_hard_stop:
+                        for o in orders:
+                            if str(o.get("type", "")).lower() == "stop" and str(o.get("side", "")).lower() == "buy":
+                                await _cancel_order_by_id(str(o.get("id", "")))
+                                logger.info("Short %s — hard stop replaced by trailing stop", symbol)
+                else:
+                    if not has_hard_stop:
+                        price = await get_latest_price(symbol)
+                        if price:
+                            stop_price = round(price * 1.02, 2)
+                            from backend.execution import _post_order
+                            _fb = await _post_order({
+                                "symbol": symbol,
+                                "qty": str(int(abs(qty))),
+                                "side": "buy",
+                                "type": "stop",
+                                "time_in_force": "gtc",
+                                "stop_price": str(stop_price),
+                            })
+                            if _fb:
+                                logger.warning("Short %s — hard stop fallback placed at %.2f", symbol, stop_price)
+                            else:
+                                logger.error("Short %s — UNPROTECTED: trailing stop AND hard stop fallback both failed (qty=%s)", symbol, qty)
+                    else:
+                        logger.warning("Short %s — trailing stop failed, hard stop still active", symbol)
+
     async def _protect_positions(self) -> None:
         if not _is_regular_market_hours():
             # A trailing stop or hard stop submitted here cannot fill until
@@ -1029,96 +1138,10 @@ class botV3:
         try:
             positions = await _get_open_positions()
             for p in positions:
-                symbol = p.get("symbol")
-                qty = float(p.get("qty", 0))
-                if not symbol or qty == 0:
-                    continue
-                _ledger = load_ledger()
-                _sym_entries = _ledger.get(symbol, [])
-                _sym_open_entry = None
-                if isinstance(_sym_entries, list):
-                    _sym_open_entry = next((e for e in reversed(_sym_entries) if e.get("status") == "open"), None)
-                _sym_strategy = _entry_kind(_sym_open_entry) if _sym_open_entry else ""
-                _is_long_hold = _sym_strategy in ("smarttiq", "nexus")
-                if _sym_open_entry:
-                    _entry_created = _from_iso(_sym_open_entry.get("created_at"))
-                    if _entry_created and (datetime.now(ET) - _entry_created).total_seconds() < _PROTECT_GRACE_SECONDS:
-                        continue
-                orders = await _get_open_orders_for_symbol(symbol)
-                order_types = [str(o.get("type", "")).lower() for o in orders]
-                order_sides = [str(o.get("side", "")).lower() for o in orders]
-                if qty > 0:
-                    has_trailing = any(t == "trailing_stop" for t, s in zip(order_types, order_sides) if s == "sell")
-                    has_hard_stop = any(t == "stop" for t, s in zip(order_types, order_sides) if s == "sell")
-                    if _is_long_hold and not has_hard_stop:
-                        price = await get_latest_price(symbol)
-                        if price:
-                            stop_price = round(price * 0.92, 2)
-                            from backend.execution import _post_order
-                            await _post_order({
-                                "symbol": symbol,
-                                "qty": str(int(qty)),
-                                "side": "sell",
-                                "type": "stop",
-                                "time_in_force": "gtc",
-                                "stop_price": str(stop_price),
-                            })
-                            logger.info("Long-hold %s — hard stop placed at %.2f (8%% below)", symbol, stop_price)
-                    if not has_trailing and not has_hard_stop and not _is_long_hold:
-                        logger.warning("Long %s — attempting trailing stop sell (has_hard_stop=%s)", symbol, has_hard_stop)
-                        trail_id = await place_trailing_stop_sell(symbol, qty, trail_percent=5.0)
-                        if trail_id:
-                            if has_hard_stop:
-                                for o in orders:
-                                    if str(o.get("type", "")).lower() == "stop" and str(o.get("side", "")).lower() == "sell":
-                                        await _cancel_order_by_id(str(o.get("id", "")))
-                                        logger.info("Long %s — hard stop replaced by trailing stop", symbol)
-                        else:
-                            if not has_hard_stop:
-                                price = await get_latest_price(symbol)
-                                if price:
-                                    stop_price = round(price * 0.95, 2)
-                                    from backend.execution import _post_order
-                                    await _post_order({
-                                        "symbol": symbol,
-                                        "qty": str(int(qty)),
-                                        "side": "sell",
-                                        "type": "stop",
-                                        "time_in_force": "gtc",
-                                        "stop_price": str(stop_price),
-                                    })
-                                    logger.warning("Long %s — hard stop fallback placed at %.2f", symbol, stop_price)
-                            else:
-                                logger.warning("Long %s — trailing stop failed, hard stop still active", symbol)
-                elif qty < 0:
-                    has_trailing = any(t == "trailing_stop" for t, s in zip(order_types, order_sides) if s == "buy")
-                    has_hard_stop = any(t == "stop" for t, s in zip(order_types, order_sides) if s == "buy")
-                    if not has_trailing and not has_hard_stop:
-                        logger.warning("Short %s — attempting trailing stop buy (has_hard_stop=%s)", symbol, has_hard_stop)
-                        trail_id = await place_trailing_stop_buy(symbol, abs(qty), 4.0)
-                        if trail_id:
-                            if has_hard_stop:
-                                for o in orders:
-                                    if str(o.get("type", "")).lower() == "stop" and str(o.get("side", "")).lower() == "buy":
-                                        await _cancel_order_by_id(str(o.get("id", "")))
-                                        logger.info("Short %s — hard stop replaced by trailing stop", symbol)
-                        else:
-                            if not has_hard_stop:
-                                price = await get_latest_price(symbol)
-                                if price:
-                                    stop_price = round(price * 1.02, 2)
-                                    from backend.execution import _post_order
-                                    await _post_order({
-                                        "symbol": symbol,
-                                        "qty": str(int(abs(qty))),
-                                        "side": "buy",
-                                        "type": "stop",
-                                        "time_in_force": "gtc",
-                                        "stop_price": str(stop_price),
-                                    })
-                                    logger.warning("Short %s — hard stop fallback placed at %.2f", symbol, stop_price)
-                            else:
-                                logger.warning("Short %s — trailing stop failed, hard stop still active", symbol)
+                try:
+                    await self._protect_one_position(p)
+                except Exception:
+                    logger.exception("_protect_positions: failed on %s — continuing with the rest", p.get("symbol"))
         except Exception:
             logger.exception("_protect_positions failed")
 
@@ -1682,6 +1705,7 @@ class botV3:
             _open_position_count = len(self.trading_client.get_all_positions())
         except Exception:
             _open_position_count = len(open_positions)
+        _new_entries_this_pass = 0
         _rotations_this_cycle = 0
         _max_rotations_per_cycle = _cfg_int("MAX_ROTATIONS_PER_CYCLE", 2)
         _rotation_margin = _cfg_float("ROTATION_PRIORITY_MARGIN", 0.15)
@@ -1830,6 +1854,7 @@ class botV3:
                 )
                 logger.info("Long entry: %s qty=%d price=%.2f score=%.3f", symbol, qty, fill_price or price, score)
                 _open_position_count += 1
+                _new_entries_this_pass += 1
                 if _is_tradetiq_buy:
                     _TRADETIQ_CATEGORY_COUNTS[_tradetiq_category] = _TRADETIQ_CATEGORY_COUNTS.get(_tradetiq_category, 0) + 1
                 from backend.health_check import record_buy
@@ -1906,13 +1931,26 @@ class botV3:
                         "momentum_score": momentum_score,
                         "confidence": confidence,
                         "short": True,
+                        "trailing_stop_pct": round(_short_stop_loss_pct * 100, 3),
                         "spy_trend_up": spy_trend_up,
                         "signal_direction": "sell",
                         **metadata,
                     },
                 )
                 logger.info("Short entry: %s qty=%d price=%.2f score=%.3f", symbol, qty, fill_price or price, score)
+                _new_entries_this_pass += 1
         save_ledger(ledger)
+        if _new_entries_this_pass > 0:
+            # The scan-loop protect pass skips positions younger than
+            # _PROTECT_GRACE_SECONDS and then doesn't run again for a long
+            # time (every 20 batches / end of the cycle), so a stop that failed
+            # to attach right after a buy burst could stay missing for hours.
+            # Re-check right after this burst, once the grace window has passed.
+            try:
+                await asyncio.sleep(_PROTECT_GRACE_SECONDS + 5)
+                await self._protect_positions()
+            except Exception:
+                logger.exception("post-buy protect pass failed")
 
     async def run_once(self, paper_only: bool = True) -> dict[str, Any]:
         self._reset_cycle_cache()
