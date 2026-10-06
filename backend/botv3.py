@@ -32,6 +32,7 @@ from backend.execution import (
     _get_open_positions,
     _cancel_order_by_id,
     _is_regular_market_hours,
+    cancel_stray_bracket_legs,
 )
 from backend.services.bars_service import get_bars
 from backend.services.account_service import get_account_buying_power
@@ -1073,6 +1074,16 @@ class botV3:
         orders = await _get_open_orders_for_symbol(symbol)
         order_types = [str(o.get("type", "")).lower() for o in orders]
         order_sides = [str(o.get("side", "")).lower() for o in orders]
+        _exit_side = "sell" if qty > 0 else "buy"
+        if not any(t in ("trailing_stop", "stop") for t, s in zip(order_types, order_sides) if s == _exit_side):
+            # No stop at all. If a leftover bracket take-profit leg is still
+            # live it reserves the shares and every stop we try gets rejected,
+            # so clear it first and re-read the open orders.
+            if await cancel_stray_bracket_legs(symbol, _exit_side):
+                logger.warning("%s — cleared stray bracket take-profit leg before attaching stop", symbol)
+                orders = await _get_open_orders_for_symbol(symbol)
+                order_types = [str(o.get("type", "")).lower() for o in orders]
+                order_sides = [str(o.get("side", "")).lower() for o in orders]
         if qty > 0:
             has_trailing = any(t == "trailing_stop" for t, s in zip(order_types, order_sides) if s == "sell")
             has_hard_stop = any(t == "stop" for t, s in zip(order_types, order_sides) if s == "sell")

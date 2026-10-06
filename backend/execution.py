@@ -375,12 +375,68 @@ async def _get_order_by_id(order_id: str) -> Optional[dict]:
 
 
 async def _cancel_order_by_id(order_id: str) -> None:
+    # Retry on rate limits / transient errors: during a buy burst a single
+    # 429 here used to leave a bracket leg alive, and the live leg then held
+    # the shares so the replacement trailing stop could never be placed.
+    for attempt in range(4):
+        try:
+            resp = await _request("DELETE", f"{ALPACA_BASE_URL}/v2/orders/{order_id}")
+            if resp.status_code in (204, 200, 404, 422):
+                return
+            logger.warning(
+                "Cancel order response for %s: %s %s (attempt %d/4)",
+                order_id, resp.status_code, resp.text, attempt + 1,
+            )
+            if resp.status_code != 429 and resp.status_code < 500:
+                return
+        except Exception:
+            logger.exception("Failed to cancel order %s (attempt %d/4)", order_id, attempt + 1)
+        await asyncio.sleep(1.5 * (attempt + 1))
+
+
+def _is_bracket_leg(o: dict) -> bool:
+    return (
+        str(o.get("order_class", "")).lower() in ("bracket", "oco", "oto")
+        or bool(o.get("parent_order_id"))
+    )
+
+
+async def cancel_stray_bracket_legs(symbol: str, exit_side: str = "sell") -> int:
+    """Cancel leftover take-profit (limit) bracket legs for a position that has
+    no stop. A live limit leg reserves the shares, so Alpaca rejects the
+    trailing stop / fallback stop ("insufficient qty available") and the
+    position stays naked until the leg expires at the close. Returns how many
+    legs were cancelled; waits (bounded) for them to clear."""
+    cancelled = 0
     try:
-        resp = await _request("DELETE", f"{ALPACA_BASE_URL}/v2/orders/{order_id}")
-        if resp.status_code not in (204, 200, 404, 422):
-            logger.warning("Cancel order response for %s: %s %s", order_id, resp.status_code, resp.text)
+        orders = await _get_open_orders_for_symbol(symbol)
+        stray = [
+            o for o in orders
+            if str(o.get("side", "")).lower() == exit_side
+            and str(o.get("type", "")).lower() == "limit"
+            and str(o.get("status", "")).lower() not in _TERMINAL_STATUSES
+            and _is_bracket_leg(o)
+        ]
+        for o in stray:
+            oid = o.get("id")
+            if oid:
+                await _cancel_order_by_id(str(oid))
+                cancelled += 1
+        if cancelled:
+            for _ in range(10):
+                await asyncio.sleep(1.0)
+                rem = await _get_open_orders_for_symbol(symbol)
+                if not any(
+                    str(o.get("side", "")).lower() == exit_side
+                    and str(o.get("type", "")).lower() == "limit"
+                    and str(o.get("status", "")).lower() not in _TERMINAL_STATUSES
+                    and _is_bracket_leg(o)
+                    for o in rem
+                ):
+                    break
     except Exception:
-        logger.exception("Failed to cancel order %s", order_id)
+        logger.exception("cancel_stray_bracket_legs failed for %s", symbol)
+    return cancelled
 
 
 async def _cancel_all_open_sell_orders(symbol: str) -> None:
@@ -758,11 +814,27 @@ async def place_bracket_buy(
                     settled = True
                     break
 
+            # A leg that survived the first cancel (rate limit / lag) would
+            # block the trailing stop AND the fallback stop. Re-cancel and
+            # re-check a couple of times before giving up.
+            for _retry in range(2):
+                if settled:
+                    break
+                logger.warning("Bracket legs for %s still open — re-cancelling (retry %d/2)", symbol, _retry + 1)
+                await _cancel_all_open_sell_orders(symbol)
+                remaining = await _get_open_orders_for_symbol(symbol)
+                settled = not [
+                    o for o in remaining
+                    if str(o.get("side", "")).lower() == "sell"
+                    and str(o.get("status", "")).lower()
+                    not in {"filled", "canceled", "rejected", "expired"}
+                ]
+
             if not settled:
-                logger.warning(
-                    "Bracket legs for %s did not settle after %.0fs — "
-                    "bracket stays active, trailing stop queued for market open",
-                    symbol, _CANCEL_SETTLE_ATTEMPTS * _CANCEL_SETTLE_DELAY,
+                logger.error(
+                    "Bracket legs for %s did not settle after retries — position may hold only a "
+                    "take-profit leg; protect pass will re-cancel and attach a stop, trailing queued",
+                    symbol,
                 )
                 if use_trailing and trailing_stop_pct > 0:
                     _deferred_trailing_stops[symbol] = trailing_stop_pct
