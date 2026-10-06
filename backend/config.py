@@ -80,6 +80,32 @@ NEWS_WATCH_MAX_TAGGED = int(_env.get("NEWS_WATCH_MAX_TAGGED", "4"))
 # (x2, x3, x4) each time it's repriced; converted to a market exit at the open.
 NEWS_EXIT_LIMIT_SLIP_PCT = float(_env.get("NEWS_EXIT_LIMIT_SLIP_PCT", "0.03"))
 NEWS_EXIT_REPRICE_SECONDS = float(_env.get("NEWS_EXIT_REPRICE_SECONDS", "120"))
+# Premarket gap guard (part of news_watch): 4:00-9:30 ET, a held position whose
+# price is >= GAP_GUARD_PCT AGAINST it vs the prior close (down for a long, up
+# for a short) on GAP_GUARD_CONFIRM_POLLS consecutive polls is exited with an
+# extended-hours limit. If it recovers to under half that by the open, the exit is
+# cancelled and a GAP_RESTORE_TRAIL_PCT trailing stop is put back instead.
+GAP_GUARD_ENABLED = _env.get("GAP_GUARD_ENABLED", "true").lower() == "true"
+GAP_GUARD_PCT = float(_env.get("GAP_GUARD_PCT", "0.07"))
+GAP_GUARD_CONFIRM_POLLS = int(_env.get("GAP_GUARD_CONFIRM_POLLS", "2"))
+GAP_RESTORE_TRAIL_PCT = float(_env.get("GAP_RESTORE_TRAIL_PCT", "2.0"))
+# ── Entry quality filters (long AND short candidate loops in botv3._handle_signals) ──
+# Added after the cash bot flushed 9 flat low-volatility ETFs through the stagnant
+# exit in one morning: positions that can't move a couple of percent a day can
+# never reach a take-profit, so every round trip just pays the spread.
+# MIN_DAILY_RANGE_PCT: skip a candidate whose average (high-low)/close over the last
+#   ~14 daily bars is below this fraction (0.012 = 1.2%). Set 0 to disable. Fails
+#   open (doesn't block) if there are fewer than 5 daily bars. Daily bars come from
+#   the IEX feed, which can understate the range of thinly traded names, so don't
+#   set this much above ~1.5%.
+# MAX_NEW_ENTRIES_PER_CYCLE: at most this many new positions per scan cycle, best
+#   priority first (shorts share the same counter). 0 = unlimited.
+# MIN_ENTRY_PRIORITY: skip candidates whose trade_priority score is below this.
+#   0 = off. Leave off until the ledger's priority-vs-outcome data suggests a value.
+# Tradetiq (curated) buys are exempt from the range floor, the priority floor and the cap.
+MIN_DAILY_RANGE_PCT = float(_env.get("MIN_DAILY_RANGE_PCT", "0.012"))
+MAX_NEW_ENTRIES_PER_CYCLE = int(_env.get("MAX_NEW_ENTRIES_PER_CYCLE", "8"))
+MIN_ENTRY_PRIORITY = float(_env.get("MIN_ENTRY_PRIORITY", "0.0"))
 # "Let it run" trailing-stop ratchet. A position's trailing stop starts at
 # the tight momentum-scaled width from build_exit_plan (0.5-1.5%, floored by
 # TRAILING_STOP_FLOOR_PCT) — sized for the signal's risk AT ENTRY, and it

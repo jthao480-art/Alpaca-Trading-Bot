@@ -217,6 +217,36 @@ def _ratchet_tiers() -> list[tuple[float, float]]:
     return tiers
 
 
+async def _avg_daily_range_pct(symbol: str, days: int = 14) -> float | None:
+    """
+    Average (high - low) / close over the last ~`days` daily bars, as a
+    fraction (0.012 = 1.2%). None when there isn't enough data to say, in
+    which case callers fail OPEN (don't block the entry). Used by the
+    MIN_DAILY_RANGE_PCT entry floor: a low-volatility fund that typically
+    moves a few tenths of a percent a day cannot reach a take-profit and just
+    gets flushed flat by the stagnant exit the next morning, paying the spread
+    both ways for nothing.
+    """
+    try:
+        bars = await get_bars(symbol, timeframe="1Day", limit=days + 1)
+    except Exception:
+        logger.exception("daily range lookup failed for %s", symbol)
+        return None
+    ranges: list[float] = []
+    for b in (bars or [])[-days:]:
+        try:
+            h = float(b.get("h") or 0)
+            l = float(b.get("l") or 0)
+            c = float(b.get("c") or 0)
+        except Exception:
+            continue
+        if c > 0 and h >= l > 0:
+            ranges.append((h - l) / c)
+    if len(ranges) < 5:
+        return None
+    return sum(ranges) / len(ranges)
+
+
 def compute_momentum_score(signal: dict[str, Any]) -> float:
     metadata = signal.get("metadata", {}) or {}
     base_score = float(signal.get("score", 0.0) or 0.0)
@@ -1776,6 +1806,35 @@ class botV3:
                     "Candidate %s dropped — qty<1 (allowed=$%.2f price=$%.2f)", symbol, allowed_dollars, float(price),
                 )
                 continue
+            # Entry filters. These run BEFORE the position-cap/rotation block on
+            # purpose: a candidate that fails a filter must never cause an
+            # existing holding to be rotated out. Tradetiq buys are curated
+            # upstream and keep their own category balance, so they skip them.
+            if not _is_tradetiq_buy:
+                _max_new = _cfg_int("MAX_NEW_ENTRIES_PER_CYCLE", 8)
+                if _max_new > 0 and _new_entries_this_pass >= _max_new:
+                    logger.info(
+                        "Entry cap: %d new entries this cycle (MAX_NEW_ENTRIES_PER_CYCLE) — "
+                        "skipping the remaining lower-priority candidates",
+                        _new_entries_this_pass,
+                    )
+                    break
+                _min_prio = _cfg_float("MIN_ENTRY_PRIORITY", 0.0)
+                if _min_prio > 0 and priority < _min_prio:
+                    logger.info(
+                        "Candidate %s dropped — priority %.3f below MIN_ENTRY_PRIORITY %.3f",
+                        symbol, priority, _min_prio,
+                    )
+                    continue
+                _min_range = _cfg_float("MIN_DAILY_RANGE_PCT", 0.012)
+                if _min_range > 0:
+                    _rng = await _avg_daily_range_pct(symbol)
+                    if _rng is not None and _rng < _min_range:
+                        logger.info(
+                            "Candidate %s dropped — avg daily range %.2f%% below %.2f%% floor (too quiet to reach a target)",
+                            symbol, _rng * 100, _min_range * 100,
+                        )
+                        continue
             if _open_position_count >= _max_positions:
                 if _rotations_this_cycle >= _max_rotations_per_cycle:
                     logger.info(
@@ -1881,6 +1940,22 @@ class botV3:
                 continue
             if symbol in _PENDING_BUYS or symbol in _BOUGHT_THIS_SESSION:
                 continue
+            _max_new = _cfg_int("MAX_NEW_ENTRIES_PER_CYCLE", 8)
+            if _max_new > 0 and _new_entries_this_pass >= _max_new:
+                logger.info(
+                    "Entry cap: %d new entries this cycle (MAX_NEW_ENTRIES_PER_CYCLE) — skipping remaining shorts",
+                    _new_entries_this_pass,
+                )
+                break
+            _min_range = _cfg_float("MIN_DAILY_RANGE_PCT", 0.012)
+            if _min_range > 0:
+                _rng = await _avg_daily_range_pct(symbol)
+                if _rng is not None and _rng < _min_range:
+                    logger.info(
+                        "Short candidate %s dropped — avg daily range %.2f%% below %.2f%% floor",
+                        symbol, _rng * 100, _min_range * 100,
+                    )
+                    continue
             buying_power = float(get_account_buying_power() or 0.0)
             min_cash_reserve = float(getattr(config, "MIN_CASH_RESERVE", 0.0))
             buying_power = max(0.0, buying_power - min_cash_reserve)
