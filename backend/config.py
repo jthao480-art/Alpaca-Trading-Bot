@@ -62,6 +62,24 @@ ROTATION_MAX_WINNER_PLPC = float(_env.get("ROTATION_MAX_WINNER_PLPC", "0.015"))
 # once the book is full, so one cycle can't unwind a large chunk of the
 # portfolio chasing whatever signals happen to fire that pass.
 MAX_ROTATIONS_PER_CYCLE = int(_env.get("MAX_ROTATIONS_PER_CYCLE", "2"))
+# ── Held-position news watcher (backend/news_watch.py) ───────────────────────
+# Exit-only: polls Alpaca news every NEWS_WATCH_INTERVAL_SECONDS for the symbols
+# currently held (04:00-20:00 ET weekdays, so premarket/after-hours included) and
+# exits a long on strongly NEGATIVE news / a short on strongly POSITIVE news.
+NEWS_WATCH_ENABLED = _env.get("NEWS_WATCH_ENABLED", "true").lower() == "true"
+# true = log what it WOULD do but place no orders.
+NEWS_WATCH_DRY_RUN = _env.get("NEWS_WATCH_DRY_RUN", "false").lower() == "true"
+NEWS_WATCH_INTERVAL_SECONDS = float(_env.get("NEWS_WATCH_INTERVAL_SECONDS", "60"))
+# On the first poll after a restart, how far back to look for unseen articles.
+NEWS_WATCH_LOOKBACK_MINUTES = float(_env.get("NEWS_WATCH_LOOKBACK_MINUTES", "30"))
+# FinBERT confidence needed (when no catastrophic phrase matched) to act.
+NEWS_WATCH_MIN_CONF = float(_env.get("NEWS_WATCH_MIN_CONF", "0.90"))
+# Articles tagging more than this many symbols are market roundups — ignored.
+NEWS_WATCH_MAX_TAGGED = int(_env.get("NEWS_WATCH_MAX_TAGGED", "4"))
+# Extended-hours exit: marketable limit this far through the last price, widened
+# (x2, x3, x4) each time it's repriced; converted to a market exit at the open.
+NEWS_EXIT_LIMIT_SLIP_PCT = float(_env.get("NEWS_EXIT_LIMIT_SLIP_PCT", "0.03"))
+NEWS_EXIT_REPRICE_SECONDS = float(_env.get("NEWS_EXIT_REPRICE_SECONDS", "120"))
 # "Let it run" trailing-stop ratchet. A position's trailing stop starts at
 # the tight momentum-scaled width from build_exit_plan (0.5-1.5%, floored by
 # TRAILING_STOP_FLOOR_PCT) — sized for the signal's risk AT ENTRY, and it

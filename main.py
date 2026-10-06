@@ -260,6 +260,8 @@ async def main() -> None:
     from backend.health_check import health_monitor_loop
     asyncio.create_task(health_monitor_loop())
     asyncio.create_task(monitor_position_protection(interval_seconds=7200))
+    from backend.news_watch import monitor_held_news
+    asyncio.create_task(monitor_held_news())
 
     # Run one immediate protection sweep at startup
     if _is_regular_market_hours():
