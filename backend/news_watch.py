@@ -24,6 +24,15 @@ What it does, every NEWS_WATCH_INTERVAL_SECONDS (default 60) between
          through the last price, repriced deeper every NEWS_EXIT_REPRICE_SECONDS
          if unfilled; converted to a plain market exit the moment the regular
          session opens.
+Premarket gap guard (same exit machinery): between 4:00 and 9:30 ET a held position
+whose price is GAP_GUARD_PCT (default 7%) or more AGAINST it versus the prior close
+(down for a long, up for a short) on GAP_GUARD_CONFIRM_POLLS consecutive polls is
+exited with the same extended-hours limit. If it hasn't filled by the open and the
+move has retraced to under half the threshold, the exit is cancelled and a trailing
+stop is put back instead of dumping into a recovered open; otherwise it becomes a
+market exit at the open. Premarket only: after hours there is no clean "prior close"
+to measure against (the day's own move would trip it), so after-hours risk is
+covered by the news triggers alone.
 This never opens or adds to a position. Set NEWS_WATCH_DRY_RUN=true to log the
 decisions without placing any order, NEWS_WATCH_ENABLED=false to turn it off.
 """
@@ -49,6 +58,8 @@ from backend.execution import (
     _request,
     place_market_cover,
     place_market_sell,
+    place_trailing_stop_buy,
+    place_trailing_stop_sell,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,13 +100,13 @@ _NEG_PATTERNS = [
     r"\bsubpoena",
     r"(sec|doj|justice department|department of justice)[^.]{0,30}(investigation|inquiry|probe|charges|charged|subpoena)",
     r"\brestate(d|ment|s)?\b",
-    r"\bfraud\b",
+    r"(securities|accounting|wire|bank) fraud|alleg\w* [^.]{0,40}fraud|accused of [^.]{0,30}fraud|charged with [^.]{0,30}fraud",
     r"accounting (irregularit|error|fraud)",
     r"auditor (resign|dismiss)",
     r"(withdraws?|withdrew|suspends?) (its )?(full-year |annual )?(financial )?(guidance|outlook)",
     r"(cuts?|lowers?|slashes|reduces?) (its )?(full-year |annual |fy ?\d{2,4} )?(revenue |earnings |eps )?(guidance|outlook|forecast)",
     r"short[- ]seller report",
-    r"(voluntary )?(product )?recall",
+    r"voluntary recall|(announces?|issues?|initiates?|expands?) [^.]{0,30}\brecall\b",
     r"(announces?|prices?|priced|pricing) [^.]{0,60}(underwritten|public) offering",
     r"material weakness",
     r"ceo (resigns|steps down|terminated|fired)",
@@ -176,6 +187,51 @@ _seen_ids: set[str] = set()
 # symbol -> {"ts": first trigger, "last": last order time, "attempt": n, "reason": str}
 _actions: dict[str, dict[str, Any]] = {}
 _last_poll: Optional[datetime] = None
+_gap_hits: dict[str, int] = {}
+
+
+def _is_premarket(now: datetime) -> bool:
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return 4 * 60 <= minutes < 9 * 60 + 30
+
+
+def _against_move(pos: dict[str, Any]) -> Optional[float]:
+    """Fractional move of the price vs the prior close, signed so a positive
+    number is bad for the position (down for a long, up for a short)."""
+    try:
+        cur = float(pos.get("current_price") or 0)
+        prev = float(pos.get("lastday_price") or 0)
+        qty = float(pos.get("qty") or 0)
+    except Exception:
+        return None
+    if cur <= 0 or prev <= 0 or qty == 0:
+        return None
+    chg = cur / prev - 1.0
+    return -chg if qty > 0 else chg
+
+
+async def _restore_protection(symbol: str, qty: float) -> None:
+    """Cancel leftover premarket exit orders and put a trailing stop back."""
+    if _cfg_b("NEWS_WATCH_DRY_RUN", False):
+        logger.warning("GAP GUARD %s recovered — would restore trailing stop [DRY RUN]", symbol)
+        return
+    trail = _cfg_f("GAP_RESTORE_TRAIL_PCT", 2.0)
+    tid = None
+    try:
+        if qty < 0:
+            if await _cancel_all_open_orders_for_side(symbol, "buy"):
+                tid = await place_trailing_stop_buy(symbol, abs(qty), trail)
+        else:
+            await _cancel_all_open_sell_orders(symbol)
+            tid = await place_trailing_stop_sell(symbol, qty, trail)
+    except Exception:
+        logger.exception("news_watch: restoring protection failed for %s", symbol)
+    if tid:
+        logger.warning("GAP GUARD %s recovered by the open — premarket exit cancelled, trailing stop %.1f%% restored id=%s", symbol, trail, tid)
+    else:
+        logger.error("GAP GUARD %s — could not restore trailing stop; _protect_positions will retry", symbol)
 
 
 def _in_watch_window(now: datetime) -> bool:
@@ -256,9 +312,10 @@ async def _do_exit(symbol: str, qty: float, price: float, state: dict[str, Any])
     dry = _cfg_b("NEWS_WATCH_DRY_RUN", False)
     regular = _is_regular_market_hours()
     mode = "market" if regular else f"extended-hours limit (attempt {state['attempt'] + 1})"
+    tag = "GAP" if state.get("kind") == "gap" else "NEWS"
     logger.warning(
-        "NEWS EXIT %s qty=%s px=%.2f via %s | reason=%s%s",
-        symbol, qty, price, mode, state["reason"], " [DRY RUN]" if dry else "",
+        "%s EXIT %s qty=%s px=%.2f via %s | reason=%s%s",
+        tag, symbol, qty, price, mode, state["reason"], " [DRY RUN]" if dry else "",
     )
     if dry:
         state["last"] = time.time()
@@ -274,9 +331,9 @@ async def _do_exit(symbol: str, qty: float, price: float, state: dict[str, Any])
     state["attempt"] += 1
     state["regular"] = regular
     if oid:
-        logger.warning("NEWS EXIT %s order placed id=%s", symbol, oid)
+        logger.warning("%s EXIT %s order placed id=%s", tag, symbol, oid)
     else:
-        logger.error("NEWS EXIT %s order NOT placed — will retry next cycle", symbol)
+        logger.error("%s EXIT %s order NOT placed — will retry next cycle", tag, symbol)
 
 
 async def _poll_once() -> None:
@@ -294,7 +351,7 @@ async def _poll_once() -> None:
 
     # drop actions for positions that are gone (exit filled)
     for sym in [s for s in _actions if s not in held]:
-        logger.warning("NEWS EXIT %s — position closed", sym)
+        logger.warning("%s EXIT %s — position closed", "GAP" if _actions[sym].get("kind") == "gap" else "NEWS", sym)
         _actions.pop(sym, None)
     if not held:
         _last_poll = datetime.now(timezone.utc)
@@ -328,9 +385,29 @@ async def _poll_once() -> None:
                 "NEWS TRIGGER %s (%s) | %s | headline=%r",
                 sym, "short" if qty < 0 else "long", reason, str(art.get("headline"))[:140],
             )
-            _actions[sym] = {"ts": time.time(), "last": 0.0, "attempt": 0, "reason": reason, "regular": False}
+            _actions[sym] = {"ts": time.time(), "last": 0.0, "attempt": 0, "reason": reason, "regular": False, "kind": "news"}
     if len(_seen_ids) > 5000:
         _seen_ids.clear()
+
+    # premarket gap guard
+    if _cfg_b("GAP_GUARD_ENABLED", True) and _is_premarket(datetime.now(_ET)):
+        gap_pct = _cfg_f("GAP_GUARD_PCT", 0.07)
+        need = max(1, int(_cfg_f("GAP_GUARD_CONFIRM_POLLS", 2)))
+        for sym, pos in held.items():
+            if sym in _actions:
+                continue
+            mv = _against_move(pos)
+            if mv is None or mv < gap_pct:
+                _gap_hits.pop(sym, None)
+                continue
+            _gap_hits[sym] = _gap_hits.get(sym, 0) + 1
+            if _gap_hits[sym] >= need:
+                qty = float(pos.get("qty") or 0)
+                reason = f"premarket gap {mv:.1%} against {'short' if qty < 0 else 'long'} vs prior close"
+                logger.warning("GAP TRIGGER %s | %s (confirmed %d polls)", sym, reason, _gap_hits[sym])
+                _actions[sym] = {"ts": time.time(), "last": 0.0, "attempt": 0, "reason": reason, "regular": False, "kind": "gap"}
+    else:
+        _gap_hits.clear()
 
     # place / re-place exits for everything triggered and still held
     reprice = _cfg_f("NEWS_EXIT_REPRICE_SECONDS", 120)
@@ -348,6 +425,12 @@ async def _poll_once() -> None:
         # becomes a market exit (fresh retry budget), however many times it
         # was repriced overnight
         convert = regular and not state.get("regular")
+        if convert and state.get("kind") == "gap":
+            mv = _against_move(pos)
+            if mv is None or mv < _cfg_f("GAP_GUARD_PCT", 0.07) / 2:
+                await _restore_protection(sym, qty)
+                _actions.pop(sym, None)
+                continue
         if convert:
             state["attempt"] = 0
         elif state["attempt"] >= 8:
