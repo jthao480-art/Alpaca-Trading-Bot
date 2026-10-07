@@ -106,6 +106,22 @@ GAP_RESTORE_TRAIL_PCT = float(_env.get("GAP_RESTORE_TRAIL_PCT", "2.0"))
 MIN_DAILY_RANGE_PCT = float(_env.get("MIN_DAILY_RANGE_PCT", "0.012"))
 MAX_NEW_ENTRIES_PER_CYCLE = int(_env.get("MAX_NEW_ENTRIES_PER_CYCLE", "8"))
 MIN_ENTRY_PRIORITY = float(_env.get("MIN_ENTRY_PRIORITY", "0.0"))
+
+# Volume-fade exit for runners (winners only). A long that is up at least
+# VOLUME_FADE_MIN_GAIN_PCT percent is sold at market when the last
+# VOLUME_FADE_RECENT_MINUTES of volume runs below VOLUME_FADE_RATIO x its own
+# earlier-session pace, on VOLUME_FADE_CONFIRM_CHECKS consecutive checks that
+# are at least VOLUME_FADE_CHECK_SECONDS apart. Needs VOLUME_FADE_MIN_EARLIER_MINUTES
+# of session and VOLUME_FADE_MIN_EARLIER_SHARES of IEX volume before it trusts the
+# ratio (IEX is only a slice of total volume, so keep the share floor modest).
+VOLUME_FADE_EXIT_ENABLED = _env.get("VOLUME_FADE_EXIT_ENABLED", "true").lower() == "true"
+VOLUME_FADE_MIN_GAIN_PCT = float(_env.get("VOLUME_FADE_MIN_GAIN_PCT", "1.0"))
+VOLUME_FADE_RATIO = float(_env.get("VOLUME_FADE_RATIO", "0.5"))
+VOLUME_FADE_RECENT_MINUTES = int(_env.get("VOLUME_FADE_RECENT_MINUTES", "15"))
+VOLUME_FADE_MIN_EARLIER_MINUTES = float(_env.get("VOLUME_FADE_MIN_EARLIER_MINUTES", "30"))
+VOLUME_FADE_CONFIRM_CHECKS = int(_env.get("VOLUME_FADE_CONFIRM_CHECKS", "2"))
+VOLUME_FADE_CHECK_SECONDS = float(_env.get("VOLUME_FADE_CHECK_SECONDS", "120"))
+VOLUME_FADE_MIN_EARLIER_SHARES = float(_env.get("VOLUME_FADE_MIN_EARLIER_SHARES", "1000"))
 # "Let it run" trailing-stop ratchet. A position's trailing stop starts at
 # the tight momentum-scaled width from build_exit_plan (0.5-1.5%, floored by
 # TRAILING_STOP_FLOOR_PCT) — sized for the signal's risk AT ENTRY, and it

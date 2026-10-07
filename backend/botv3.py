@@ -67,6 +67,41 @@ _MAX_SELL_ATTEMPTS: int = 3
 # stale/empty result and wrongly conclude the position has no protection.
 _PROTECT_GRACE_SECONDS: float = float(getattr(config, "PROTECT_GRACE_SECONDS", 45))
 
+
+_VOLUME_FADE_STATE: dict[str, dict[str, float]] = {}
+
+
+async def _volume_fade_reading(symbol: str, recent_minutes: int, now_et: datetime):
+    """Today's volume pace for `symbol`: last `recent_minutes` vs everything
+    earlier in the session (1-minute bars, shares per wall-clock minute so
+    minutes with no prints count as zero). Returns
+    (ratio, recent_rate, earlier_rate, earlier_minutes, earlier_shares) or None."""
+    bars = await get_bars(symbol, timeframe="1Min", limit=1000)
+    open_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    cutoff = now_et - timedelta(minutes=recent_minutes)
+    recent_vol = 0.0
+    earlier_vol = 0.0
+    for b in bars or []:
+        try:
+            ts = datetime.fromisoformat(str(b.get("t")).replace("Z", "+00:00")).astimezone(ET)
+            vol = float(b.get("v") or 0)
+        except Exception:
+            continue
+        if ts < open_et:
+            continue
+        if ts >= cutoff:
+            recent_vol += vol
+        else:
+            earlier_vol += vol
+    earlier_minutes = (cutoff - open_et).total_seconds() / 60.0
+    if earlier_minutes <= 0 or recent_minutes <= 0:
+        return None
+    recent_rate = recent_vol / recent_minutes
+    earlier_rate = earlier_vol / earlier_minutes
+    if earlier_rate <= 0:
+        return None
+    return recent_rate / earlier_rate, recent_rate, earlier_rate, earlier_minutes, earlier_vol
+
 MAX_POSITIONS = int(getattr(config, "MAX_POSITIONS", 150))
 DAILY_LOSS_LIMIT = float(getattr(config, "DAILY_LOSS_LIMIT", -2000))
 MARKET_FILTER_THRESHOLD = float(getattr(config, "MARKET_FILTER_THRESHOLD", -0.005))
@@ -989,7 +1024,7 @@ class botV3:
 
     async def _close_position_market(self, symbol: str, qty: float, reason: str, ledger: Any) -> None:
         try:
-            if reason in ("intraday_time_exit", "stagnant_exit"):
+            if reason in ("intraday_time_exit", "stagnant_exit", "runner_volume_fade"):
                 existing_orders = await _get_open_orders_for_symbol(symbol)
                 for o in existing_orders:
                     if str(o.get("side", "")).lower() == "sell":
@@ -1276,6 +1311,108 @@ class botV3:
                     "ratchet_widen_failed symbol=%s unrealized_plpc=%.4f target=%.2f%% — position left on prior stop",
                     symbol, plpc, target_trail,
                 )
+
+    async def _volume_fade_exit_pass(self) -> None:
+        """
+        Exit for "runners": a long that is already up by VOLUME_FADE_MIN_GAIN_PCT
+        is sold at market when its volume dries up — the last
+        VOLUME_FADE_RECENT_MINUTES of volume running below VOLUME_FADE_RATIO of
+        its earlier-session pace, on VOLUME_FADE_CONFIRM_CHECKS checks in a row
+        (checks are at least VOLUME_FADE_CHECK_SECONDS apart, so one quiet
+        minute can't trigger it). Winners only: losers and flat positions stay
+        with their stop and the stagnant exit. The older signal-based
+        volume-fade exit skips intraday-signal positions and needs volume
+        metadata they never carry, so it never covered these.
+        """
+        if not bool(getattr(config, "VOLUME_FADE_EXIT_ENABLED", True)):
+            return
+        if not _is_regular_market_hours():
+            return
+        now_et = datetime.now(ET)
+        if now_et.hour * 60 + now_et.minute >= 15 * 60 + 50:
+            return  # the end-of-day sweep owns the close
+        recent_min = _cfg_int("VOLUME_FADE_RECENT_MINUTES", 15)
+        min_earlier = _cfg_float("VOLUME_FADE_MIN_EARLIER_MINUTES", 30.0)
+        open_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        if (now_et - open_et).total_seconds() / 60.0 < recent_min + min_earlier:
+            return  # not enough of the session yet to measure a pace
+        min_gain = _cfg_float("VOLUME_FADE_MIN_GAIN_PCT", 1.0) / 100.0
+        ratio_thr = _cfg_float("VOLUME_FADE_RATIO", 0.5)
+        confirm = max(1, _cfg_int("VOLUME_FADE_CONFIRM_CHECKS", 2))
+        every = _cfg_float("VOLUME_FADE_CHECK_SECONDS", 120.0)
+        min_shares = _cfg_float("VOLUME_FADE_MIN_EARLIER_SHARES", 1000.0)
+        try:
+            positions = await _get_open_positions()
+        except Exception:
+            logger.exception("_volume_fade_exit_pass: failed to fetch positions")
+            return
+        if not positions:
+            return
+        ledger = load_ledger()
+        held = set()
+        for p in positions:
+            symbol = p.get("symbol")
+            try:
+                qty = float(p.get("qty", 0) or 0)
+                plpc = float(p.get("unrealized_plpc", 0) or 0)
+            except Exception:
+                continue
+            if not symbol or qty <= 0:
+                continue  # long side only
+            held.add(symbol)
+            if plpc < min_gain:
+                _VOLUME_FADE_STATE.pop(symbol, None)
+                continue  # only runners
+            if symbol in _PENDING_SELLS or symbol in _PENDING_BUYS:
+                continue
+            entries = ledger.get(symbol, [])
+            open_entry = (
+                next((e for e in reversed(entries) if e.get("status") == "open"), None)
+                if isinstance(entries, list) else None
+            )
+            if open_entry is None or _entry_kind(open_entry) in _LONG_HOLD_KINDS:
+                continue
+            st = _VOLUME_FADE_STATE.setdefault(symbol, {"strikes": 0.0, "ts": 0.0})
+            now_ts = datetime.now().timestamp()
+            if now_ts - st["ts"] < every:
+                continue
+            st["ts"] = now_ts
+            try:
+                reading = await _volume_fade_reading(symbol, recent_min, now_et)
+            except Exception:
+                logger.exception("volume_fade_reading failed for %s", symbol)
+                continue
+            if reading is None:
+                continue
+            ratio, recent_rate, earlier_rate, earlier_minutes, earlier_shares = reading
+            if earlier_minutes < min_earlier or earlier_shares < min_shares:
+                st["strikes"] = 0.0
+                continue  # not enough volume history to trust the ratio
+            if ratio < ratio_thr:
+                st["strikes"] += 1
+            else:
+                st["strikes"] = 0.0
+            logger.info(
+                "volume_fade_check symbol=%s gain=%.2f%% ratio=%.2f recent=%.1f/min earlier=%.1f/min strikes=%d/%d",
+                symbol, plpc * 100.0, ratio, recent_rate, earlier_rate, int(st["strikes"]), confirm,
+            )
+            if st["strikes"] < confirm:
+                continue
+            logger.warning(
+                "volume_fade_exit symbol=%s gain=%.2f%% ratio=%.2f (threshold %.2f) — selling the runner",
+                symbol, plpc * 100.0, ratio, ratio_thr,
+            )
+            open_entry.setdefault("metadata", {})["volume_fade_ratio"] = round(ratio, 3)
+            _PENDING_SELLS.add(symbol)
+            try:
+                await self._close_position_market(symbol, qty, "runner_volume_fade", ledger)
+                save_ledger(ledger)
+            finally:
+                _PENDING_SELLS.discard(symbol)
+            _VOLUME_FADE_STATE.pop(symbol, None)
+        for sym in list(_VOLUME_FADE_STATE):
+            if sym not in held:
+                _VOLUME_FADE_STATE.pop(sym, None)
 
     def _count_trading_days(self, start: datetime, end: datetime) -> int:
         count = 0
@@ -2069,6 +2206,7 @@ class botV3:
             if i > 0 and (i // self.batch_size) % 20 == 0:
                 await self._protect_positions()
                 await self._ratchet_trailing_stops()
+                await self._volume_fade_exit_pass()
         _now_et = datetime.now(ET)
         _market_open = _now_et.replace(hour=9, minute=30, second=0, microsecond=0)
         _entry_cutoff = _now_et.replace(hour=16, minute=0, second=0, microsecond=0)
@@ -2084,6 +2222,7 @@ class botV3:
             logger.info("Skipping signal processing — outside market hours (%s ET)", _now_et.strftime("%H:%M"))
         await self._protect_positions()
         await self._ratchet_trailing_stops()
+        await self._volume_fade_exit_pass()
         return {
             "paper_only": paper_only,
             "signals": all_signals,
