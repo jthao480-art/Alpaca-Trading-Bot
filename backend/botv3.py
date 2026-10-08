@@ -218,6 +218,53 @@ def _cfg_int(name: str, default: int) -> int:
     return int(getattr(config, name, default) or default)
 
 
+def _cfg_int_zero_ok(name: str, default: int) -> int:
+    """Like _cfg_int, but an explicit 0 stays 0 (used for '0 = unlimited' caps)."""
+    try:
+        return int(getattr(config, name, default))
+    except Exception:
+        return default
+
+
+def _entry_blocklist() -> set[str]:
+    raw = str(getattr(config, "ENTRY_BLOCKLIST", "") or "")
+    return {s.strip().upper() for s in raw.split(",") if s.strip()}
+
+
+def _entries_opened_today(ledger: dict[str, Any]) -> int:
+    """New non-Tradetiq entries created today (ET), counted from the ledger so
+    the daily cap survives restarts and redeploys."""
+    today = datetime.now(ET).date()
+    n = 0
+    for entries in ledger.values():
+        if not isinstance(entries, list):
+            continue
+        for e in entries:
+            if not isinstance(e, dict) or str(e.get("strategy", "")).lower() == "tradetiq":
+                continue
+            dt = _from_iso(e.get("created_at"))
+            if dt is not None and dt.astimezone(ET).date() == today:
+                n += 1
+    return n
+
+
+def _closed_within_hours(ledger: dict[str, Any], symbol: str, hours: float) -> bool:
+    """True if `symbol` had a position closed within the last `hours` hours."""
+    if hours <= 0:
+        return False
+    entries = ledger.get(symbol, [])
+    if not isinstance(entries, list):
+        return False
+    cutoff = datetime.now(ET) - timedelta(hours=hours)
+    for e in entries:
+        if not isinstance(e, dict) or e.get("status") == "open":
+            continue
+        dt = _from_iso(e.get("closed_at"))
+        if dt is not None and dt.astimezone(ET) >= cutoff:
+            return True
+    return False
+
+
 def _cfg_any_float(*names: str, default: float = 0.0) -> float:
     for name in names:
         value = getattr(config, name, None)
@@ -1884,6 +1931,7 @@ class botV3:
         except Exception:
             _open_position_count = len(open_positions)
         _new_entries_this_pass = 0
+        _entries_today_base = _entries_opened_today(ledger)
         _rotations_this_cycle = 0
         _max_rotations_per_cycle = _cfg_int("MAX_ROTATIONS_PER_CYCLE", 2)
         _rotation_margin = _cfg_float("ROTATION_PRIORITY_MARGIN", 0.15)
@@ -1959,7 +2007,25 @@ class botV3:
             # existing holding to be rotated out. Tradetiq buys are curated
             # upstream and keep their own category balance, so they skip them.
             if not _is_tradetiq_buy:
-                _max_new = _cfg_int("MAX_NEW_ENTRIES_PER_CYCLE", 8)
+                _blocked = _entry_blocklist()
+                if symbol.upper() in _blocked:
+                    logger.info("Candidate %s dropped — in ENTRY_BLOCKLIST (decaying/volatility product)", symbol)
+                    continue
+                _reentry_h = _cfg_float("REENTRY_COOLDOWN_HOURS", 36.0)
+                if _reentry_h > 0 and _closed_within_hours(ledger, symbol, _reentry_h):
+                    logger.info(
+                        "Candidate %s dropped — closed within the last %.0fh (REENTRY_COOLDOWN_HOURS)",
+                        symbol, _reentry_h,
+                    )
+                    continue
+                _max_day = _cfg_int_zero_ok("MAX_NEW_ENTRIES_PER_DAY", 15)
+                if _max_day > 0 and (_entries_today_base + _new_entries_this_pass) >= _max_day:
+                    logger.info(
+                        "Daily entry cap: %d new entries today (MAX_NEW_ENTRIES_PER_DAY=%d) — skipping the rest",
+                        _entries_today_base + _new_entries_this_pass, _max_day,
+                    )
+                    break
+                _max_new = _cfg_int_zero_ok("MAX_NEW_ENTRIES_PER_CYCLE", 8)
                 if _max_new > 0 and _new_entries_this_pass >= _max_new:
                     logger.info(
                         "Entry cap: %d new entries this cycle (MAX_NEW_ENTRIES_PER_CYCLE) — "
@@ -2088,7 +2154,19 @@ class botV3:
                 continue
             if symbol in _PENDING_BUYS or symbol in _BOUGHT_THIS_SESSION:
                 continue
-            _max_new = _cfg_int("MAX_NEW_ENTRIES_PER_CYCLE", 8)
+            if symbol.upper() in _entry_blocklist():
+                continue
+            _reentry_h = _cfg_float("REENTRY_COOLDOWN_HOURS", 36.0)
+            if _reentry_h > 0 and _closed_within_hours(ledger, symbol, _reentry_h):
+                continue
+            _max_day = _cfg_int_zero_ok("MAX_NEW_ENTRIES_PER_DAY", 15)
+            if _max_day > 0 and (_entries_today_base + _new_entries_this_pass) >= _max_day:
+                logger.info(
+                    "Daily entry cap: %d new entries today (MAX_NEW_ENTRIES_PER_DAY=%d) — skipping remaining shorts",
+                    _entries_today_base + _new_entries_this_pass, _max_day,
+                )
+                break
+            _max_new = _cfg_int_zero_ok("MAX_NEW_ENTRIES_PER_CYCLE", 8)
             if _max_new > 0 and _new_entries_this_pass >= _max_new:
                 logger.info(
                     "Entry cap: %d new entries this cycle (MAX_NEW_ENTRIES_PER_CYCLE) — skipping remaining shorts",

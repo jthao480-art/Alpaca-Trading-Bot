@@ -107,6 +107,19 @@ MIN_DAILY_RANGE_PCT = float(_env.get("MIN_DAILY_RANGE_PCT", "0.012"))
 MAX_NEW_ENTRIES_PER_CYCLE = int(_env.get("MAX_NEW_ENTRIES_PER_CYCLE", "8"))
 MIN_ENTRY_PRIORITY = float(_env.get("MIN_ENTRY_PRIORITY", "0.0"))
 
+# Daily / re-entry / blocklist entry gates (Tradetiq curated buys are exempt).
+# MAX_NEW_ENTRIES_PER_DAY: hard cap on new non-Tradetiq entries per ET day, counted
+#   from the ledger (survives restarts). The per-cycle cap above only limits one scan
+#   pass; this limits the day. 0 = unlimited.
+# REENTRY_COOLDOWN_HOURS: don't re-buy a symbol that was closed within this many hours
+#   (stops the stagnant-flush -> re-buy churn across days). 0 = off.
+# ENTRY_BLOCKLIST: comma-separated symbols never bought (decaying volatility /
+#   inverse single-stock products whose daily range passes the range floor but whose
+#   price drifts down). Add any others you want blocked.
+MAX_NEW_ENTRIES_PER_DAY = int(_env.get("MAX_NEW_ENTRIES_PER_DAY", "15"))
+REENTRY_COOLDOWN_HOURS = float(_env.get("REENTRY_COOLDOWN_HOURS", "36"))
+ENTRY_BLOCKLIST = _env.get("ENTRY_BLOCKLIST", "VXX,UVXY,UVIX,SVIX,SVXY,VIXY,VIXM,TSLZ,SNXX,TSLS,NVDS,AAPD,MSFD")
+
 # Volume-fade exit for runners (winners only). A long that is up at least
 # VOLUME_FADE_MIN_GAIN_PCT percent is sold at market when the last
 # VOLUME_FADE_RECENT_MINUTES of volume runs below VOLUME_FADE_RATIO x its own
