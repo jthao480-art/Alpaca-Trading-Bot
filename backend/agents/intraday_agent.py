@@ -37,6 +37,7 @@ true — an untouched deployment runs all four exactly as before):
 """
 
 import asyncio
+import logging
 import statistics
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
@@ -171,6 +172,64 @@ def _get_trailing_volumes(symbol: str, hour: int) -> list[float]:
     return _volume_baseline.get(_baseline_key(symbol, hour), [])
 
 
+# ── Wave relative volume (rebuilt) ─────────────────────────────────────────
+# The original baseline was an in-memory list that appended today's running
+# volume on every scan, so (a) it was wiped by every restart/redeploy and
+# (b) its "20 days" were really 20 scans, mostly from the same day, with the
+# current reading included in its own average — so Wave either never fired or
+# compared today against itself. This computes the real thing straight from
+# Alpaca history, so nothing needs to accumulate and restarts don't matter:
+# today's cumulative volume since the open, divided by the average of the
+# previous sessions' cumulative volume over the SAME time-of-day window.
+# Thresholds (down >=1% from open, rel-vol >=1.3x, 20-day lookback) are
+# unchanged. It only runs for stocks already down >=1% from today's open,
+# which is the only case Wave could fire anyway, to keep data calls low.
+_WAVE_HIST_CACHE: dict[tuple, tuple[Optional[float], int]] = {}
+_WAVE_MIN_PRIOR_SESSIONS = 14  # >= 70% of the 20-day lookback
+
+
+async def _wave_relative_volume_from_history(symbol: str) -> tuple[Optional[float], int]:
+    """Returns (relative_volume or None, number_of_prior_sessions_used)."""
+    now_et = datetime.now(ET)
+    cut_min = (now_et.hour * 60 + now_et.minute) // 30 * 30   # completed 30-min bars only
+    key = (symbol, now_et.date().isoformat(), cut_min)
+    if key in _WAVE_HIST_CACHE:
+        return _WAVE_HIST_CACHE[key]
+    if len(_WAVE_HIST_CACHE) > 20000:
+        _WAVE_HIST_CACHE.clear()
+    result: tuple[Optional[float], int] = (None, 0)
+    try:
+        from backend.services.bars_service import _service, _default_window
+        start, end = _default_window(35)
+        payload = await _service.get_bars(symbol, start, end, timeframe="30Min", limit=1000)
+        bars = (payload.get("bars") or []) if isinstance(payload, dict) else []
+        open_min = 9 * 60 + 30
+        per_day: dict[str, float] = {}
+        for b in bars:
+            try:
+                ts = datetime.fromisoformat(str(b.get("t")).replace("Z", "+00:00")).astimezone(ET)
+                vol = float(b.get("v") or 0)
+            except Exception:
+                continue
+            m = ts.hour * 60 + ts.minute
+            if m < open_min or m >= cut_min:
+                continue
+            d = ts.date().isoformat()
+            per_day[d] = per_day.get(d, 0.0) + vol
+        today = now_et.date().isoformat()
+        today_cum = per_day.pop(today, 0.0)
+        prior = [per_day[d] for d in sorted(per_day)][-WAVE_REL_VOL_LOOKBACK_DAYS:]
+        if today_cum > 0 and len(prior) >= _WAVE_MIN_PRIOR_SESSIONS:
+            result = (get_wave_relative_volume(today_cum, prior, lookback_days=len(prior)), len(prior))
+        else:
+            result = (None, len(prior))
+    except Exception:
+        logging.getLogger(__name__).exception("wave rel-vol history failed for %s", symbol)
+    _WAVE_HIST_CACHE[key] = result
+    return result
+
+
+
 class IntradayAgent(BaseAgent):
     name = "intraday"
 
@@ -248,14 +307,17 @@ class IntradayAgent(BaseAgent):
             if regime_passed is None:
                 regime_passed = True  # default to True if insufficient SPY data
 
-            # Record volume for Wave baseline
-            current_hour = datetime.now(ET).hour
-            if today_volume > 0:
-                _record_volume(symbol, current_hour, today_volume)
-
-            # Wave relative volume
-            trailing_vols = _get_trailing_volumes(symbol, current_hour)
-            rel_vol = get_wave_relative_volume(today_volume, trailing_vols)
+            # Wave relative volume: real same-time-of-day baseline from Alpaca
+            # history (see _wave_relative_volume_from_history). Only computed
+            # for stocks already down >= WAVE_MOMENTUM_THRESHOLD from the open.
+            rel_vol = None
+            wave_baseline_days = 0
+            if (
+                getattr(config, "USE_WAVE_PROVISIONAL", True)
+                and today_open > 0
+                and (current_price - today_open) / today_open <= WAVE_MOMENTUM_THRESHOLD
+            ):
+                rel_vol, wave_baseline_days = await _wave_relative_volume_from_history(symbol)
 
             # ── Run all 4 checks — each individually toggleable via Railway
             # Variables (USE_RIPPLE / USE_ARES_PROVISIONAL / USE_WAVE_PROVISIONAL /
@@ -302,7 +364,7 @@ class IntradayAgent(BaseAgent):
                 "today_open": today_open,
                 "current_price": current_price,
                 "relative_volume": round(rel_vol, 3) if rel_vol is not None else None,
-                "wave_baseline_days": len(trailing_vols),
+                "wave_baseline_days": wave_baseline_days,
             }
 
             # Priority: Ripple > Ares > Wave > Surge
