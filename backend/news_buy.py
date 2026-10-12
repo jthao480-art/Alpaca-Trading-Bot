@@ -17,6 +17,16 @@ Two tiers
      NEWS_BUY_WIDE_MIN_MOVE_PCT vs the prior close). Reduced size
      (NEWS_BUY_WIDE_SIZE_MULT). Set NEWS_BUY_WIDE_ENABLED=false for A only.
 
+  C  "social-led": a ticker that is suddenly hot on Reddit (ApeWisdom) or on
+     StockTwits trending (backend/social_buzz.py) AND has a recent positive
+     Alpaca article (FinBERT >= NEWS_BUY_SOCIAL_MIN_CONF, no negatives) AND is
+     already up >= NEWS_BUY_SOCIAL_MIN_MOVE_PCT. Social buzz alone never buys --
+     it has to be backed by real news. Half size, NEWS_BUY_SOCIAL_MAX_PER_DAY.
+  Social also acts on A/B: a clearly bearish StockTwits crowd vetoes the buy
+  (sell-the-news), a hot ticker gets NEWS_BUY_SOCIAL_BOOST_MULT size on tier A
+  and can confirm tier B in place of a +1% price move (needs price >= 0%).
+  Set NEWS_BUY_SOCIAL_ENABLED=false / NEWS_BUY_SOCIAL_LED_ENABLED=false to drop it.
+
 Filters (all must pass) -- the point is to avoid chasing and to avoid junk
   * article <= NEWS_BUY_MAX_AGE_MINUTES old, tags <= NEWS_BUY_MAX_TAGGED symbols
     (roundups ignored), symbol named in the text when two are tagged
@@ -51,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -128,8 +139,9 @@ _FLUFF_RX = re.compile(
 )
 
 
-async def classify_buy(article: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Return {"tier": "A"|"B", "reason": str, "conf": float} or None."""
+async def classify_buy(article: dict[str, Any], wide_conf: Optional[float] = None) -> Optional[dict[str, Any]]:
+    """Return {"tier": "A"|"B", "reason": str, "conf": float} or None.
+    wide_conf overrides the FinBERT-only confidence bar (used by the social-led path)."""
     headline = str(article.get("headline") or "")
     text = _clean_text(article)
     if _FLUFF_RX.search(headline):
@@ -145,8 +157,8 @@ async def classify_buy(article: dict[str, Any]) -> Optional[dict[str, Any]]:
         if label == "negative" and conf >= 0.6:
             return None
         return {"tier": "A", "reason": f"phrase:'{hit}'", "conf": conf if label == "positive" else 0.0}
-    if _cfg_b("NEWS_BUY_WIDE_ENABLED", True):
-        if label == "positive" and conf >= _cfg_f("NEWS_BUY_WIDE_MIN_CONF", 0.95):
+    if wide_conf is not None or _cfg_b("NEWS_BUY_WIDE_ENABLED", True):
+        if label == "positive" and conf >= (wide_conf if wide_conf is not None else _cfg_f("NEWS_BUY_WIDE_MIN_CONF", 0.95)):
             return {"tier": "B", "reason": f"finbert positive {conf:.2f}", "conf": conf}
     return None
 
@@ -247,11 +259,12 @@ async def _snapshot(symbol: str) -> Optional[dict[str, Any]]:
     }
 
 
-def _ledger_checks(ledger: dict[str, Any], symbol: str) -> Optional[str]:
+def _ledger_checks(ledger: dict[str, Any], symbol: str, tier: str = "A") -> Optional[str]:
     """Return a reason string if the ledger forbids a buy, else None."""
     now = datetime.now(timezone.utc)
     today = datetime.now(_ET).date()
     n_today = 0
+    n_social = 0
     for sym, entries in ledger.items():
         if not isinstance(entries, list):
             continue
@@ -261,11 +274,16 @@ def _ledger_checks(ledger: dict[str, Any], symbol: str) -> Optional[str]:
             ca = _parse_ts(e.get("created_at"))
             if str(e.get("strategy", "")).lower() == "newsbuy" and ca is not None and ca.astimezone(_ET).date() == today:
                 n_today += 1
+                if (e.get("metadata") or {}).get("tier") == "C":
+                    n_social += 1
                 if sym == symbol:
                     return "already news-bought today"
     cap = int(_cfg_f("NEWS_BUY_MAX_PER_DAY", 4))
     if cap > 0 and n_today >= cap:
         return f"daily news-buy cap {n_today}/{cap}"
+    scap = int(_cfg_f("NEWS_BUY_SOCIAL_MAX_PER_DAY", 2))
+    if tier == "C" and scap > 0 and n_social >= scap:
+        return f"daily social-led cap {n_social}/{scap}"
     hours = _cfg_f("NEWS_BUY_REENTRY_HOURS", 12.0)
     for e in ledger.get(symbol, []) if isinstance(ledger.get(symbol), list) else []:
         if not isinstance(e, dict):
@@ -359,14 +377,21 @@ async def _extended_buy(symbol: str, qty: int, limit: float, trail: float) -> tu
     return oid, avg, filled
 
 
-async def _execute_buy(article: dict[str, Any], symbol: str, verdict: dict[str, Any], snap: dict[str, Any]) -> bool:
+async def _execute_buy(
+    article: dict[str, Any], symbol: str, verdict: dict[str, Any], snap: dict[str, Any], buzz: Optional[dict[str, Any]] = None
+) -> bool:
     headline = str(article.get("headline") or "")[:200]
     extended = not _is_regular_market_hours()
     acct = await _get_account()
     if not acct:
         return False
     equity = float(acct.get("equity") or 0)
-    mult = 1.0 if verdict["tier"] == "A" else _cfg_f("NEWS_BUY_WIDE_SIZE_MULT", 0.5)
+    if verdict["tier"] == "A":
+        mult = _cfg_f("NEWS_BUY_SOCIAL_BOOST_MULT", 1.25) if (buzz and buzz.get("hot")) else 1.0
+    elif verdict["tier"] == "C":
+        mult = _cfg_f("NEWS_BUY_SOCIAL_SIZE_MULT", 0.5)
+    else:
+        mult = _cfg_f("NEWS_BUY_WIDE_SIZE_MULT", 0.5)
     notional = equity * _cfg_f("NEWS_BUY_POSITION_PCT", 2.0) / 100.0 * mult
     notional = min(notional, _cfg_f("NEWS_BUY_MAX_POSITION_USD", 2000.0))
     ref_px = snap["price"] * (1.0 + _cfg_f("NEWS_BUY_EXT_LIMIT_SLIP_PCT", 0.5) / 100.0) if extended else snap["price"]
@@ -375,7 +400,7 @@ async def _execute_buy(article: dict[str, Any], symbol: str, verdict: dict[str, 
         logger.info("NEWS BUY %s skipped — size %.0f too small for price %.2f", symbol, notional, ref_px)
         return False
     trail = _cfg_f("NEWS_BUY_TRAIL_PCT", 2.0)
-    tag = f"tier {verdict['tier']} {verdict['reason']}"
+    tag = f"tier {verdict['tier']} {verdict['reason']}" + (f" | social: {buzz['reason']}" if buzz and buzz.get("hot") else "")
     if _cfg_b("NEWS_BUY_DRY_RUN", False):
         logger.warning(
             "NEWS BUY [DRY RUN] %s qty=%d @~%.2f (%s, %+.1f%% vs prior close, %s) | %s",
@@ -434,6 +459,9 @@ async def _execute_buy(article: dict[str, Any], symbol: str, verdict: dict[str, 
             "use_trailing": True,
             "trailing_stop_pct": trail,
             "size_multiplier": mult,
+            "social_hot": bool(buzz and buzz.get("hot")),
+            "social_reason": (buzz or {}).get("reason", ""),
+            "crowd_bullish_pct": (buzz or {}).get("bullish_pct"),
         },
     )
     save_ledger(ledger)
@@ -546,7 +574,7 @@ async def _consider(article: dict[str, Any], symbol: str, verdict: dict[str, Any
         return skip("daily loss halt")
     async with _buy_lock:
         ledger = load_ledger()
-        why = _ledger_checks(ledger, symbol)
+        why = _ledger_checks(ledger, symbol, verdict["tier"])
         if why:
             return skip(why)
         positions = await _get_open_positions()
@@ -569,8 +597,23 @@ async def _consider(article: dict[str, Any], symbol: str, verdict: dict[str, Any
             return skip(f"thin (prior $vol {snap['prev_dollar_vol']:,.0f})")
         if snap["chg_pct"] > _cfg_f("NEWS_BUY_MAX_CHASE_PCT", 8.0):
             return skip(f"already {snap['chg_pct']:+.1f}% vs prior close (chase cap)")
-        if verdict["tier"] == "B" and snap["chg_pct"] < _cfg_f("NEWS_BUY_WIDE_MIN_MOVE_PCT", 1.0):
-            return skip(f"wide-net needs price confirmation, only {snap['chg_pct']:+.1f}%")
+        buzz: Optional[dict[str, Any]] = None
+        if _cfg_b("NEWS_BUY_SOCIAL_ENABLED", True):
+            from backend.social_buzz import buzz_snapshot
+
+            buzz = await buzz_snapshot(symbol)
+            if buzz.get("bearish"):
+                return skip(f"StockTwits crowd bearish ({buzz.get('bullish_pct', 0):.0%} bullish of {buzz.get('tagged')} tagged)")
+        if verdict["tier"] == "B":
+            need = _cfg_f("NEWS_BUY_WIDE_MIN_MOVE_PCT", 1.0)
+            if snap["chg_pct"] < need and not (buzz and buzz.get("hot") and snap["chg_pct"] >= 0.0):
+                return skip(f"wide-net needs price confirmation (+{need:g}%) or social + flat/up, only {snap['chg_pct']:+.1f}%")
+        if verdict["tier"] == "C":
+            if not (buzz and buzz.get("hot")):
+                return skip("social-led: no longer hot")
+            need = _cfg_f("NEWS_BUY_SOCIAL_MIN_MOVE_PCT", 2.0)
+            if snap["chg_pct"] < need:
+                return skip(f"social-led needs price confirmation (+{need:g}%), only {snap['chg_pct']:+.1f}%")
         sp = snap["spread_pct"]
         if sp is None:
             if extended:
@@ -580,7 +623,44 @@ async def _consider(article: dict[str, Any], symbol: str, verdict: dict[str, Any
         neg = await _recent_negative(symbol)
         if neg:
             return skip(neg)
-        await _execute_buy(article, symbol, verdict, snap)
+        await _execute_buy(article, symbol, verdict, snap, buzz)
+
+
+_social_checked: dict[str, float] = {}
+
+
+async def _poll_social_once() -> None:
+    """Social-led discovery (tier C): hot Reddit / StockTwits-trending tickers that
+    also have a recent positive Alpaca article. Buzz alone never buys."""
+    from backend.social_buzz import hot_symbols
+
+    hot = await hot_symbols(int(_cfg_f("NEWS_BUY_SOCIAL_MAX_CANDIDATES", 25)))
+    if not hot:
+        return
+    now = time.time()
+    hours = _cfg_f("NEWS_BUY_SOCIAL_NEWS_HOURS", 3.0)
+    min_conf = _cfg_f("NEWS_BUY_SOCIAL_MIN_CONF", 0.85)
+    for symbol, info in hot:
+        if not _VALID_SYM.match(symbol) or _blocklisted(symbol):
+            continue
+        if now - _social_checked.get(symbol, 0.0) < 3600.0:
+            continue
+        _social_checked[symbol] = now
+        try:
+            arts = await _fetch_news([symbol], datetime.now(timezone.utc) - timedelta(hours=hours))
+        except Exception:
+            continue
+        arts = [a for a in arts if symbol in _candidates(a)]
+        arts.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
+        for a in arts[:2]:
+            verdict = await classify_buy(a, wide_conf=min_conf)
+            if not verdict:
+                continue
+            verdict = {**verdict, "tier": "C", "reason": f"social-led ({info.get('mentions', 0)} reddit mentions x{info.get('ratio', 0)}) + {verdict['reason']}"}
+            await _consider(a, symbol, verdict)
+            break
+    if len(_social_checked) > 2000:
+        _social_checked.clear()
 
 
 async def monitor_news_buys() -> None:
@@ -591,17 +671,24 @@ async def monitor_news_buys() -> None:
         return
     interval = max(20.0, _cfg_f("NEWS_BUY_INTERVAL_SECONDS", 60.0))
     logger.warning(
-        "news_buy started — interval %.0fs, %s, wide-net=%s, max %d/day",
+        "news_buy started — interval %.0fs, %s, wide-net=%s, social=%s/led=%s, max %d/day",
         interval,
         "DRY RUN" if _cfg_b("NEWS_BUY_DRY_RUN", False) else "LIVE",
         _cfg_b("NEWS_BUY_WIDE_ENABLED", True),
+        _cfg_b("NEWS_BUY_SOCIAL_ENABLED", True),
+        _cfg_b("NEWS_BUY_SOCIAL_LED_ENABLED", True),
         int(_cfg_f("NEWS_BUY_MAX_PER_DAY", 4)),
     )
+    last_social = 0.0
+    social_every = max(60.0, _cfg_f("NEWS_BUY_SOCIAL_INTERVAL_SECONDS", 300.0))
     while True:
         try:
             now = datetime.now(_ET)
             if _window_open(now) and await _is_trading_day(now):
                 await _poll_once()
+                if _cfg_b("NEWS_BUY_SOCIAL_LED_ENABLED", True) and time.time() - last_social >= social_every:
+                    last_social = time.time()
+                    await _poll_social_once()
             else:
                 _last_poll = None
         except asyncio.CancelledError:

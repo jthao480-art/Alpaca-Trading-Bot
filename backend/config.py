@@ -152,6 +152,25 @@ NEWS_BUY_HARD_STOP_PCT = float(_env.get("NEWS_BUY_HARD_STOP_PCT", "5.0"))
 NEWS_BUY_EXT_LIMIT_SLIP_PCT = float(_env.get("NEWS_BUY_EXT_LIMIT_SLIP_PCT", "0.5"))
 NEWS_BUY_EXT_FILL_WAIT_SECONDS = float(_env.get("NEWS_BUY_EXT_FILL_WAIT_SECONDS", "45"))
 
+# Social layer (backend/social_buzz.py): Reddit via ApeWisdom + StockTwits.
+# SOCIAL_ENABLED: bearish-crowd veto, tier-A size boost, tier-B confirmation.
+# SOCIAL_LED_ENABLED: tier C -- hot ticker + a recent positive Alpaca article + price already up.
+NEWS_BUY_SOCIAL_ENABLED = _env.get("NEWS_BUY_SOCIAL_ENABLED", "true").lower() == "true"
+NEWS_BUY_SOCIAL_LED_ENABLED = _env.get("NEWS_BUY_SOCIAL_LED_ENABLED", "true").lower() == "true"
+NEWS_BUY_SOCIAL_INTERVAL_SECONDS = float(_env.get("NEWS_BUY_SOCIAL_INTERVAL_SECONDS", "300"))
+NEWS_BUY_SOCIAL_MIN_MENTIONS = float(_env.get("NEWS_BUY_SOCIAL_MIN_MENTIONS", "20"))
+NEWS_BUY_SOCIAL_MIN_RATIO = float(_env.get("NEWS_BUY_SOCIAL_MIN_RATIO", "2.0"))
+NEWS_BUY_SOCIAL_MIN_RANK_JUMP = float(_env.get("NEWS_BUY_SOCIAL_MIN_RANK_JUMP", "20"))
+NEWS_BUY_SOCIAL_BEARISH_BULLISH_PCT = float(_env.get("NEWS_BUY_SOCIAL_BEARISH_BULLISH_PCT", "0.35"))
+NEWS_BUY_SOCIAL_BEARISH_MIN_TAGGED = float(_env.get("NEWS_BUY_SOCIAL_BEARISH_MIN_TAGGED", "8"))
+NEWS_BUY_SOCIAL_BOOST_MULT = float(_env.get("NEWS_BUY_SOCIAL_BOOST_MULT", "1.25"))
+NEWS_BUY_SOCIAL_SIZE_MULT = float(_env.get("NEWS_BUY_SOCIAL_SIZE_MULT", "0.5"))
+NEWS_BUY_SOCIAL_MIN_CONF = float(_env.get("NEWS_BUY_SOCIAL_MIN_CONF", "0.85"))
+NEWS_BUY_SOCIAL_MIN_MOVE_PCT = float(_env.get("NEWS_BUY_SOCIAL_MIN_MOVE_PCT", "2.0"))
+NEWS_BUY_SOCIAL_NEWS_HOURS = float(_env.get("NEWS_BUY_SOCIAL_NEWS_HOURS", "3"))
+NEWS_BUY_SOCIAL_MAX_CANDIDATES = int(_env.get("NEWS_BUY_SOCIAL_MAX_CANDIDATES", "25"))
+NEWS_BUY_SOCIAL_MAX_PER_DAY = int(_env.get("NEWS_BUY_SOCIAL_MAX_PER_DAY", "2"))
+
 # Volume-fade exit for runners (winners only). A long that is up at least
 # VOLUME_FADE_MIN_GAIN_PCT percent is sold at market when the last
 # VOLUME_FADE_RECENT_MINUTES of volume runs below VOLUME_FADE_RATIO x its own
