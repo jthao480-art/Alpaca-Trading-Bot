@@ -134,7 +134,11 @@ _FLUFF_RX = re.compile(
     r"price target|analyst|upgrade|downgrade|initiates? coverage|reiterat|"
     r"why is|why are|shares are (trading|moving|surging|jumping)|stocks? (are )?(moving|surging|jumping)|"
     r"top gainers|biggest movers|movers|unusual options|options activity|"
-    r"what('s| is) going on|is it time to|should you|here('s| is) why|\bwatch\b",
+    r"what('s| is) going on|is it time to|should you|here('s| is) why|\bwatch\b|"
+    r"\bhow (to|much)\b|ahead of (q\d|earnings|the)|what to expect|earnings preview|preview:|"
+    r"\ba (month|year|week) (from|with|by)\b|passive income|dividend (stock|income|yield)|best (stocks|etfs)|"
+    r"stocks? to (buy|watch)|buy now|buy or sell|should i|prediction|could (soar|surge|rally|double)|"
+    r"\bif you (invested|had)\b|\bwhat (is|are)\b|\bwhy (is|are)\b",
     re.I,
 )
 
@@ -220,18 +224,28 @@ async def _asset_ok(symbol: str) -> bool:
 async def _snapshot(symbol: str) -> Optional[dict[str, Any]]:
     """price, prior close, change vs prior close, spread, prior dollar volume."""
     base = str(getattr(config, "ALPACA_DATA_URL", "https://data.alpaca.markets")).rstrip("/")
+    s = None
     try:
-        resp = await _request("GET", f"{base}/v2/stocks/{symbol}/snapshot", params={"feed": "iex"})
-        if resp.status_code != 200:
+        for attempt in range(3):
+            resp = await _request("GET", f"{base}/v2/stocks/{symbol}/snapshot", params={"feed": "iex"})
+            if resp.status_code == 200:
+                s = resp.json()
+                break
+            if resp.status_code == 429 and attempt < 2:
+                await asyncio.sleep(2.0 * (attempt + 1))
+                continue
+            logger.info("news_buy: snapshot %s -> HTTP %s %s", symbol, resp.status_code, resp.text[:120])
             return None
-        s = resp.json()
     except Exception:
         logger.exception("news_buy: snapshot failed for %s", symbol)
+        return None
+    if not isinstance(s, dict):
         return None
     trade = s.get("latestTrade") or {}
     price = float(trade.get("p") or 0)
     tdt = _parse_ts(trade.get("t"))
     if price <= 0 or tdt is None:
+        logger.info("news_buy: snapshot %s has no usable latest trade (%s)", symbol, trade)
         return None
     today = datetime.now(_ET).date()
     daily, prev = s.get("dailyBar") or {}, s.get("prevDailyBar") or {}
@@ -242,6 +256,7 @@ async def _snapshot(symbol: str) -> Optional[dict[str, Any]]:
     elif prev:
         ref = prev
     if not ref or not float(ref.get("c") or 0):
+        logger.info("news_buy: snapshot %s has no prior daily bar", symbol)
         return None
     ref_close = float(ref["c"])
     quote = s.get("latestQuote") or {}
@@ -504,7 +519,6 @@ async def _poll_once() -> None:
     start = now_utc - max_age
     if _last_poll is not None:
         start = max(start, _last_poll - timedelta(minutes=2))
-    _last_poll = now_utc
 
     base = str(getattr(config, "ALPACA_DATA_URL", "https://data.alpaca.markets")).rstrip("/")
     articles: list[dict[str, Any]] = []
@@ -521,6 +535,8 @@ async def _poll_once() -> None:
         resp = await _request("GET", f"{base}/v1beta1/news", params=params)
         if resp.status_code != 200:
             logger.warning("news_buy: news fetch %s %s", resp.status_code, resp.text[:200])
+            if not articles:
+                return  # nothing fetched: keep the old window so the next poll retries it
             break
         data = resp.json()
         articles.extend(a for a in (data.get("news") or []) if isinstance(a, dict))
@@ -528,6 +544,7 @@ async def _poll_once() -> None:
         if not token:
             break
 
+    _last_poll = now_utc
     fresh = []
     for a in articles:
         aid = str(a.get("id", ""))
@@ -646,6 +663,7 @@ async def _poll_social_once() -> None:
         if now - _social_checked.get(symbol, 0.0) < 3600.0:
             continue
         _social_checked[symbol] = now
+        await asyncio.sleep(1.0)  # be gentle: the main scan shares this Alpaca data rate limit
         try:
             arts = await _fetch_news([symbol], datetime.now(timezone.utc) - timedelta(hours=hours))
         except Exception:

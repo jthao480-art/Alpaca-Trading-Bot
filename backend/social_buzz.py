@@ -10,7 +10,8 @@ Sources (no API keys needed; both already used by agents/social_agent.py):
 What it answers
   hot      : is this ticker suddenly being talked about? (Reddit mentions >=
              SOCIAL_MIN_MENTIONS AND (>= SOCIAL_MIN_RATIO x yesterday's mentions OR
-             climbed >= SOCIAL_MIN_RANK_JUMP ranks), or on StockTwits trending)
+             climbed >= SOCIAL_MIN_RANK_JUMP ranks)). StockTwits trending only
+             corroborates; it never makes a ticker hot on its own.
   bearish  : is the tagged StockTwits crowd clearly bearish? (bullish share <=
              SOCIAL_BEARISH_BULLISH_PCT with >= SOCIAL_BEARISH_MIN_TAGGED tagged
              messages) -- used as a veto on a positive-news buy
@@ -118,7 +119,7 @@ def _ape_hot(item: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     prev = _to_int(item.get("mentions_24h_ago"))
     rank = _to_int(item.get("rank"))
     prev_rank = _to_int(item.get("rank_24h_ago"))
-    if mentions < _cfg_f("NEWS_BUY_SOCIAL_MIN_MENTIONS", 20):
+    if mentions < _cfg_f("NEWS_BUY_SOCIAL_MIN_MENTIONS", 40):
         return None
     ratio = mentions / max(prev, 1)
     jump = (prev_rank - rank) if prev_rank and rank else 0
@@ -135,11 +136,8 @@ async def hot_symbols(limit: int = 25) -> list[tuple[str, dict[str, Any]]]:
         h = _ape_hot(item)
         if h:
             found[t] = {**h, "reddit": True, "trending": t in trending}
-    for rank, t in enumerate(trending[:30], start=1):
-        if t in found:
-            continue
-        found[t] = {"rank": 0, "mentions": 0, "prev_mentions": 0, "ratio": 0.0, "rank_jump": 0,
-                    "reddit": False, "trending": True, "st_rank": rank}
+    # StockTwits "trending" alone is not enough: it is dominated by mega caps (MSFT, NVDA, C...)
+    # that trend every day. It only corroborates a Reddit-hot ticker (flag above).
     ordered = sorted(found.items(), key=lambda kv: (kv[1].get("trending", False) and kv[1].get("reddit", False), kv[1].get("ratio", 0.0)), reverse=True)
     return ordered[:limit]
 
@@ -156,10 +154,9 @@ async def buzz_snapshot(symbol: str) -> dict[str, Any]:
             snap.update(h)
             snap["hot"] = True
             snap["reason"] = f"reddit x{h['ratio']:.1f} ({h['mentions']} mentions, rank {h['rank']})"
-        if on_trend:
-            snap["hot"] = True
+        if on_trend and snap["hot"]:
             snap["trending"] = True
-            snap["reason"] = (snap["reason"] + " + " if snap["reason"] else "") + "stocktwits trending"
+            snap["reason"] += " + stocktwits trending"
     except Exception:
         logger.exception("social_buzz: hot check failed for %s", symbol)
     try:
