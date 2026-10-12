@@ -171,6 +171,13 @@ NEWS_BUY_SOCIAL_NEWS_HOURS = float(_env.get("NEWS_BUY_SOCIAL_NEWS_HOURS", "3"))
 NEWS_BUY_SOCIAL_MAX_CANDIDATES = int(_env.get("NEWS_BUY_SOCIAL_MAX_CANDIDATES", "25"))
 NEWS_BUY_SOCIAL_MAX_PER_DAY = int(_env.get("NEWS_BUY_SOCIAL_MAX_PER_DAY", "2"))
 
+# Scan prefilter (backend/services/snapshot_prefilter.py): one Alpaca snapshot request per
+# ~500 symbols drops stocks that cannot signal (not down vs prior close / open, or penny)
+# before the agents spend bar requests on them. Bypassed when USE_DEFAULT_AGENTS=true.
+SCAN_PREFILTER_ENABLED = _env.get("SCAN_PREFILTER_ENABLED", "true").lower() == "true"
+SCAN_PREFILTER_CHUNK = int(_env.get("SCAN_PREFILTER_CHUNK", "500"))
+SCAN_PREFILTER_TOLERANCE_PCT = float(_env.get("SCAN_PREFILTER_TOLERANCE_PCT", "0.5"))
+
 # Volume-fade exit for runners (winners only). A long that is up at least
 # VOLUME_FADE_MIN_GAIN_PCT percent is sold at market when the last
 # VOLUME_FADE_RECENT_MINUTES of volume runs below VOLUME_FADE_RATIO x its own

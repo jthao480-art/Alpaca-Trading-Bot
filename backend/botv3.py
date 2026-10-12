@@ -863,6 +863,8 @@ class botV3:
             )
             if _entry_kind(open_entry) in _LONG_HOLD_KINDS:
                 continue
+            if str((open_entry or {}).get("strategy", "")).lower() == "newsbuy":
+                continue  # news-buys carry no entry priority score; never the first rotation victim
             held_priority = float(((open_entry or {}).get("metadata", {}) or {}).get("priority", 0.0) or 0.0)
             if weakest is None or held_priority < weakest[0]:
                 weakest = (held_priority, symbol, p, qty)
@@ -2253,6 +2255,45 @@ class botV3:
             except Exception:
                 logger.exception("post-buy protect pass failed")
 
+    async def _prefilter_symbols(self, symbols: list[str]) -> list[str]:
+        """Drop symbols that cannot signal today before any bar request is made
+        (see services/snapshot_prefilter.py). Fails open: any problem returns the
+        full list unchanged."""
+        try:
+            if not bool(getattr(config, "SCAN_PREFILTER_ENABLED", True)):
+                return symbols
+            if bool(getattr(config, "USE_DEFAULT_AGENTS", True)):
+                logger.warning(
+                    "Scan prefilter bypassed: USE_DEFAULT_AGENTS=true (those agents also trade up-moves)"
+                )
+                return symbols
+            _n = datetime.now(ET)
+            if _n.weekday() >= 5 or not (
+                _n.replace(hour=9, minute=30, second=0, microsecond=0)
+                <= _n
+                <= _n.replace(hour=16, minute=0, second=0, microsecond=0)
+            ):
+                return symbols
+            keep: set[str] = set()
+            try:
+                keep |= {str(s).upper() for s in (self._load_open_positions() or {}).keys()}
+            except Exception:
+                pass
+            if bool(getattr(config, "USE_TRADETIQ_AGENT", False)):
+                try:
+                    from backend.agents import tradetiq_agent as _ta
+                    await _ta._ensure_cache_fresh()
+                    keep |= {str(s).upper() for s in (_ta._CACHE.get("symbol_map") or {}).keys()}
+                except Exception:
+                    logger.exception("prefilter: could not read Tradetiq symbols")
+            from backend.services.snapshot_prefilter import prefilter_symbols
+            return await prefilter_symbols(symbols, always_keep=keep)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Scan prefilter failed — scanning the full list")
+            return symbols
+
     async def run_once(self, paper_only: bool = True) -> dict[str, Any]:
         self._reset_cycle_cache()
         self._open_positions_cache = None
@@ -2267,7 +2308,7 @@ class botV3:
             reset_daily_counts()
         all_signals: list[dict[str, Any]] = []
         errors = 0
-        symbols = list(self.symbols)
+        symbols = await self._prefilter_symbols(list(self.symbols))
         import random
         random.shuffle(symbols)
         symbols = symbols[:2000]
