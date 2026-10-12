@@ -24,6 +24,9 @@ from backend.execution import (
 load_dotenv(override=True)
 
 logging.basicConfig(level=logging.INFO)
+# one INFO line per HTTP request drowned the logs (3,000 lines ~ 6 minutes); keep warnings only
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")

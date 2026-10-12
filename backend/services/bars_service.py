@@ -212,8 +212,15 @@ async def get_latest_trade(*args, **kwargs):
 async def get_recent_bars(symbol, timeframe="5Min", limit=60, feed="iex"):
     return await get_bars(symbol, timeframe=timeframe, limit=limit, feed=feed)
 
-    # Module-level cycle cache — cleared at start of each scan cycle
+# Module-level cycle cache — cleared at start of each scan cycle
 _bars_cache: dict[str, list[dict]] = {}
+# In-flight fetches. An agent group (Ares / Wave / Intraday ...) analyses one symbol
+# concurrently, and all of them ask for the same daily bars at the same instant. The
+# cache above only fills AFTER a fetch completes, so every one of them used to miss and
+# send its own identical request (logs showed the same symbol's 1Day bars 3x within a
+# millisecond). Later callers now wait on the first caller's request instead.
+_bars_inflight: dict[str, "asyncio.Future"] = {}
+
 
 async def get_bars_cached(symbol: str, timeframe: str, limit: int) -> list[dict]:
     """Fetch bars with cycle-level caching — reuses data across agents."""
@@ -223,7 +230,18 @@ async def get_bars_cached(symbol: str, timeframe: str, limit: int) -> list[dict]
         if not bars:
             return []
         return bars[-limit:] if limit < len(bars) else bars
-    bars = await get_bars(symbol, timeframe=timeframe, limit=max(40, limit))
+    fut = _bars_inflight.get(key)
+    if fut is None:
+        fut = asyncio.ensure_future(get_bars(symbol, timeframe=timeframe, limit=max(40, limit)))
+        _bars_inflight[key] = fut
+
+        def _done(f, k=key):
+            _bars_inflight.pop(k, None)
+            if not f.cancelled():
+                f.exception()   # mark retrieved; waiters still see it via await
+
+        fut.add_done_callback(_done)
+    bars = await asyncio.shield(fut)
     if not bars:
         bars = []
     _bars_cache[key] = bars
