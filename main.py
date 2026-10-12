@@ -262,6 +262,8 @@ async def main() -> None:
     asyncio.create_task(monitor_position_protection(interval_seconds=7200))
     from backend.news_watch import monitor_held_news
     asyncio.create_task(monitor_held_news())
+    from backend.news_buy import monitor_news_buys
+    asyncio.create_task(monitor_news_buys())
 
     # Run one immediate protection sweep at startup
     if _is_regular_market_hours():

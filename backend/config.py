@@ -120,6 +120,38 @@ MAX_NEW_ENTRIES_PER_DAY = int(_env.get("MAX_NEW_ENTRIES_PER_DAY", "15"))
 REENTRY_COOLDOWN_HOURS = float(_env.get("REENTRY_COOLDOWN_HOURS", "36"))
 ENTRY_BLOCKLIST = _env.get("ENTRY_BLOCKLIST", "VXX,UVXY,UVIX,SVIX,SVXY,VIXY,VIXM,TSLZ,SNXX,TSLS,NVDS,AAPD,MSFD")
 
+# ── Positive-news BUY signal (backend/news_buy.py) ───────────────────────────
+# Watches the whole Alpaca news stream 4:00-19:30 ET (pre/after-market included)
+# and buys fresh single-company strong catalysts. NEWS_BUY_ENABLED=false turns it
+# off; NEWS_BUY_DRY_RUN=true logs decisions without ordering.
+NEWS_BUY_ENABLED = _env.get("NEWS_BUY_ENABLED", "true").lower() == "true"
+NEWS_BUY_DRY_RUN = _env.get("NEWS_BUY_DRY_RUN", "false").lower() == "true"
+NEWS_BUY_INTERVAL_SECONDS = float(_env.get("NEWS_BUY_INTERVAL_SECONDS", "60"))
+NEWS_BUY_MAX_AGE_MINUTES = float(_env.get("NEWS_BUY_MAX_AGE_MINUTES", "20"))
+NEWS_BUY_MAX_TAGGED = int(_env.get("NEWS_BUY_MAX_TAGGED", "2"))
+NEWS_BUY_LAST_MINUTE_ET = int(_env.get("NEWS_BUY_LAST_MINUTE_ET", str(19 * 60 + 30)))
+# Tier B ("wide net"): FinBERT-positive with no catalyst phrase; needs price confirmation.
+NEWS_BUY_WIDE_ENABLED = _env.get("NEWS_BUY_WIDE_ENABLED", "true").lower() == "true"
+NEWS_BUY_WIDE_MIN_CONF = float(_env.get("NEWS_BUY_WIDE_MIN_CONF", "0.95"))
+NEWS_BUY_WIDE_MIN_MOVE_PCT = float(_env.get("NEWS_BUY_WIDE_MIN_MOVE_PCT", "1.0"))
+NEWS_BUY_WIDE_SIZE_MULT = float(_env.get("NEWS_BUY_WIDE_SIZE_MULT", "0.5"))
+NEWS_BUY_MAX_FINBERT_PER_POLL = int(_env.get("NEWS_BUY_MAX_FINBERT_PER_POLL", "25"))
+# Filters
+NEWS_BUY_MAX_CHASE_PCT = float(_env.get("NEWS_BUY_MAX_CHASE_PCT", "8.0"))
+NEWS_BUY_MIN_PREV_DOLLAR_VOL = float(_env.get("NEWS_BUY_MIN_PREV_DOLLAR_VOL", "2000000"))
+NEWS_BUY_MAX_SPREAD_PCT = float(_env.get("NEWS_BUY_MAX_SPREAD_PCT", "1.5"))
+NEWS_BUY_MAX_TRADE_AGE_SECONDS = float(_env.get("NEWS_BUY_MAX_TRADE_AGE_SECONDS", "900"))
+NEWS_BUY_NEG_LOOKBACK_HOURS = float(_env.get("NEWS_BUY_NEG_LOOKBACK_HOURS", "6"))
+NEWS_BUY_REENTRY_HOURS = float(_env.get("NEWS_BUY_REENTRY_HOURS", "12"))
+NEWS_BUY_MAX_PER_DAY = int(_env.get("NEWS_BUY_MAX_PER_DAY", "4"))
+# Sizing / exits
+NEWS_BUY_POSITION_PCT = float(_env.get("NEWS_BUY_POSITION_PCT", "2.0"))
+NEWS_BUY_MAX_POSITION_USD = float(_env.get("NEWS_BUY_MAX_POSITION_USD", "2000"))
+NEWS_BUY_TRAIL_PCT = float(_env.get("NEWS_BUY_TRAIL_PCT", "2.0"))
+NEWS_BUY_HARD_STOP_PCT = float(_env.get("NEWS_BUY_HARD_STOP_PCT", "5.0"))
+NEWS_BUY_EXT_LIMIT_SLIP_PCT = float(_env.get("NEWS_BUY_EXT_LIMIT_SLIP_PCT", "0.5"))
+NEWS_BUY_EXT_FILL_WAIT_SECONDS = float(_env.get("NEWS_BUY_EXT_FILL_WAIT_SECONDS", "45"))
+
 # Volume-fade exit for runners (winners only). A long that is up at least
 # VOLUME_FADE_MIN_GAIN_PCT percent is sold at market when the last
 # VOLUME_FADE_RECENT_MINUTES of volume runs below VOLUME_FADE_RATIO x its own

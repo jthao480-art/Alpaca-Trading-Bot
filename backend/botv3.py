@@ -240,7 +240,7 @@ def _entries_opened_today(ledger: dict[str, Any]) -> int:
         if not isinstance(entries, list):
             continue
         for e in entries:
-            if not isinstance(e, dict) or str(e.get("strategy", "")).lower() == "tradetiq":
+            if not isinstance(e, dict) or str(e.get("strategy", "")).lower() in ("tradetiq", "newsbuy"):
                 continue
             dt = _from_iso(e.get("created_at"))
             if dt is not None and dt.astimezone(ET).date() == today:

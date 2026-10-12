@@ -46,6 +46,31 @@ def load_ledger() -> dict[str, list[dict[str, Any]]]:
 
 
 def save_ledger(ledger: dict[str, list[dict[str, Any]]]) -> None:
+    # news_buy.py writes "newsbuy" entries from a background task while the main scan
+    # holds an older in-memory copy for the length of an entry pass. Re-attach any
+    # newsbuy entry already on disk that the caller's copy doesn't have, so a pass
+    # that saves its stale copy can't erase it. (No awaits in here: atomic per loop.)
+    try:
+        if LEDGER_PATH.exists():
+            with LEDGER_PATH.open("r", encoding="utf-8") as f:
+                disk = json.load(f)
+            if isinstance(disk, dict):
+                for sym, entries in disk.items():
+                    if not isinstance(entries, list):
+                        continue
+                    mine = ledger.setdefault(sym, [])
+                    have = {e.get("order_id") for e in mine if isinstance(e, dict)}
+                    for e in entries:
+                        if (
+                            isinstance(e, dict)
+                            and (e.get("metadata") or {}).get("source") == "newsbuy"
+                            and e.get("order_id") not in have
+                        ):
+                            mine.append(e)
+                    if not mine:
+                        ledger.pop(sym, None)
+    except Exception:
+        pass
     LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LEDGER_PATH.open("w", encoding="utf-8") as f:
         json.dump(ledger, f, indent=2, default=str)
