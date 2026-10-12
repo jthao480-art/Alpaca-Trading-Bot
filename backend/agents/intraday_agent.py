@@ -38,6 +38,7 @@ true — an untouched deployment runs all four exactly as before):
 
 import asyncio
 import logging
+import os
 import statistics
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
@@ -230,6 +231,99 @@ async def _wave_relative_volume_from_history(symbol: str) -> tuple[Optional[floa
 
 
 
+# ── Wave relative volume: zero per-symbol calls ("curve" mode, default) ──────
+# The agent already fetches every symbol's 35 daily bars (the last one is today's
+# volume so far). Rather than pulling 35 days of 30-min bars per symbol (thousands
+# of extra requests per pass, refetched every half hour), compare today's volume to
+# that symbol's 20-day average DAILY volume scaled by how much of a normal day's
+# volume has typically traded by now. The "typical" intraday curve comes from a few
+# very liquid reference ETFs, fetched once per ET day (<= 5 requests/day total).
+# WAVE_REL_VOL_MODE=history restores the exact per-symbol 30-min method above.
+_WAVE_CURVE_REFS = ("SPY", "QQQ", "IWM", "DIA", "XLF")
+# cumulative share of the day's volume after k completed 30-min bars (k = 0..13);
+# only used if the live curve can't be built.
+_WAVE_DEFAULT_CURVE = [0.0, 0.14, 0.22, 0.28, 0.33, 0.38, 0.43, 0.48, 0.53, 0.58, 0.64, 0.71, 0.80, 1.0]
+_WAVE_CURVE_CACHE: dict[str, list[float]] = {}
+
+
+async def _wave_curve() -> list[float]:
+    today = datetime.now(ET).date().isoformat()
+    cached = _WAVE_CURVE_CACHE.get(today)
+    if cached:
+        return cached
+    curve = list(_WAVE_DEFAULT_CURVE)
+    try:
+        from backend.services.bars_service import _service, _default_window
+        start, end = _default_window(35)
+        open_min = 9 * 60 + 30
+        fracs: list[list[float]] = []
+        for ref in _WAVE_CURVE_REFS:
+            payload = await _service.get_bars(ref, start, end, timeframe="30Min", limit=1000)
+            bars = (payload.get("bars") or []) if isinstance(payload, dict) else []
+            per_day: dict[str, list[float]] = {}
+            for b in bars:
+                try:
+                    ts = datetime.fromisoformat(str(b.get("t")).replace("Z", "+00:00")).astimezone(ET)
+                    vol = float(b.get("v") or 0)
+                except Exception:
+                    continue
+                m = ts.hour * 60 + ts.minute
+                k = (m - open_min) // 30
+                if k < 0 or k > 12:
+                    continue
+                per_day.setdefault(ts.date().isoformat(), [0.0] * 13)[int(k)] += vol
+            for d, slots in per_day.items():
+                if d == today:
+                    continue
+                total = sum(slots)
+                if total > 0 and all(s > 0 for s in slots):   # full session only
+                    run, cum = 0.0, [0.0]
+                    for s in slots:
+                        run += s
+                        cum.append(run / total)
+                    fracs.append(cum)
+        if len(fracs) >= 10:
+            curve = [statistics.mean(f[i] for f in fracs) for i in range(14)]
+            curve[13] = 1.0
+    except Exception:
+        logging.getLogger(__name__).exception("wave volume curve build failed; using default curve")
+    _WAVE_CURVE_CACHE.clear()
+    _WAVE_CURVE_CACHE[today] = curve
+    return curve
+
+
+def _curve_fraction(curve: list[float], now_et: datetime) -> float:
+    """Typical share of the day's volume traded by now (interpolated inside the 30-min slot)."""
+    minutes = (now_et.hour * 60 + now_et.minute + now_et.second / 60.0) - (9 * 60 + 30)
+    if minutes <= 0:
+        return 0.0
+    if minutes >= 390:
+        return 1.0
+    k = int(minutes // 30)
+    within = (minutes - k * 30) / 30.0
+    return curve[k] + (curve[k + 1] - curve[k]) * within
+
+
+async def _wave_relative_volume_fast(daily_bars: list[dict]) -> tuple[Optional[float], int]:
+    """(relative_volume or None, prior_sessions_used) from the daily bars already in hand."""
+    now_et = datetime.now(ET)
+    try:
+        last = daily_bars[-1]
+        last_day = datetime.fromisoformat(str(last.get("t")).replace("Z", "+00:00")).astimezone(ET).date()
+        if last_day != now_et.date():
+            return None, 0                      # no trade yet today -> stale bar
+        today_vol = float(last.get("v") or 0)
+        prior = [float(b.get("v") or 0) for b in daily_bars[:-1]][-WAVE_REL_VOL_LOOKBACK_DAYS:]
+        frac = _curve_fraction(await _wave_curve(), now_et)
+        if today_vol <= 0 or frac < 0.05 or len([v for v in prior if v]) < _WAVE_MIN_PRIOR_SESSIONS:
+            return None, len(prior)
+        projected = today_vol / frac            # full-day volume at today's pace
+        return get_wave_relative_volume(projected, prior, lookback_days=len(prior)), len(prior)
+    except Exception:
+        logging.getLogger(__name__).exception("wave fast rel-vol failed")
+        return None, 0
+
+
 class IntradayAgent(BaseAgent):
     name = "intraday"
 
@@ -317,7 +411,10 @@ class IntradayAgent(BaseAgent):
                 and today_open > 0
                 and (current_price - today_open) / today_open <= WAVE_MOMENTUM_THRESHOLD
             ):
-                rel_vol, wave_baseline_days = await _wave_relative_volume_from_history(symbol)
+                if os.getenv("WAVE_REL_VOL_MODE", "curve").strip().lower() == "history":
+                    rel_vol, wave_baseline_days = await _wave_relative_volume_from_history(symbol)
+                else:
+                    rel_vol, wave_baseline_days = await _wave_relative_volume_fast(daily_bars)
 
             # ── Run all 4 checks — each individually toggleable via Railway
             # Variables (USE_RIPPLE / USE_ARES_PROVISIONAL / USE_WAVE_PROVISIONAL /
