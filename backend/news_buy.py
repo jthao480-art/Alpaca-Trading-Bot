@@ -86,6 +86,7 @@ from backend.news_watch import (
     _clean_text,
     _fetch_news,
     _finbert,
+    _paced_get,
     _phrase_hit,
 )
 from backend.services.trade_ledger_service import add_entry, load_ledger, save_ledger
@@ -226,14 +227,10 @@ async def _snapshot(symbol: str) -> Optional[dict[str, Any]]:
     base = str(getattr(config, "ALPACA_DATA_URL", "https://data.alpaca.markets")).rstrip("/")
     s = None
     try:
-        for attempt in range(3):
-            resp = await _request("GET", f"{base}/v2/stocks/{symbol}/snapshot", params={"feed": "iex"})
-            if resp.status_code == 200:
-                s = resp.json()
-                break
-            if resp.status_code == 429 and attempt < 2:
-                await asyncio.sleep(2.0 * (attempt + 1))
-                continue
+        resp = await _paced_get(f"{base}/v2/stocks/{symbol}/snapshot", {"feed": "iex"})
+        if resp.status_code == 200:
+            s = resp.json()
+        else:
             logger.info("news_buy: snapshot %s -> HTTP %s %s", symbol, resp.status_code, resp.text[:120])
             return None
     except Exception:
@@ -532,7 +529,7 @@ async def _poll_once() -> None:
         }
         if token:
             params["page_token"] = token
-        resp = await _request("GET", f"{base}/v1beta1/news", params=params)
+        resp = await _paced_get(f"{base}/v1beta1/news", params)
         if resp.status_code != 200:
             logger.warning("news_buy: news fetch %s %s", resp.status_code, resp.text[:200])
             if not articles:

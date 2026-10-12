@@ -240,6 +240,27 @@ def _in_watch_window(now: datetime) -> bool:
     return 4 <= now.hour < 20
 
 
+async def _paced_get(url: str, params: dict[str, Any]):
+    """GET on the Alpaca *data* API through the bars service's shared pacing and
+    429 pause (BARS_MAX_PER_MIN / global Retry-After). Without this the news polls
+    and snapshots spent the same rate-limit budget as the scan without ever
+    yielding to it."""
+    try:
+        from backend.services.bars_service import _service as _bars
+    except Exception:
+        _bars = None
+    resp = None
+    for attempt in range(3):
+        if _bars is not None:
+            await _bars._wait_for_slot()
+        resp = await _request("GET", url, params=params)
+        if resp.status_code == 429 and _bars is not None:
+            _bars._note_rate_limit(resp, 5.0 * (attempt + 1), url, attempt + 1)
+            continue
+        return resp
+    return resp
+
+
 async def _fetch_news(symbols: list[str], start: datetime) -> list[dict[str, Any]]:
     base = str(getattr(config, "ALPACA_DATA_URL", "https://data.alpaca.markets")).rstrip("/")
     out: list[dict[str, Any]] = []
@@ -256,7 +277,7 @@ async def _fetch_news(symbols: list[str], start: datetime) -> list[dict[str, Any
             }
             if token:
                 params["page_token"] = token
-            resp = await _request("GET", f"{base}/v1beta1/news", params=params)
+            resp = await _paced_get(f"{base}/v1beta1/news", params)
             if resp.status_code != 200:
                 logger.warning("news_watch: news fetch %s %s", resp.status_code, resp.text[:200])
                 break
