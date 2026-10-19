@@ -1484,7 +1484,35 @@ class botV3:
         except Exception:
             logger.exception("_close_short_market failed symbol=%s", symbol)
 
+    # EXIT-TIMER BEGIN -- runs the stagnant/time exits on their own clock instead of
+    # only when a full-universe scan cycle ends (a cycle can end 30+ minutes after the
+    # open, which is how winners faded before they were sold). Off unless
+    # EXIT_PASS_INTERVAL_SECONDS > 0 is set in the environment.
     async def _intraday_time_exit_pass(self, ledger: Any) -> None:
+        """Serialised entry point: a pass already running (timer or cycle end) makes
+        a second caller skip instead of double-selling."""
+        lock = self.__dict__.setdefault("_exit_pass_lock", asyncio.Lock())
+        if lock.locked():
+            return
+        async with lock:
+            await self._intraday_time_exit_pass_inner(ledger)
+
+    async def _exit_timer_loop(self, interval: float) -> None:
+        logger.info("exit_timer started — stagnant/time exits every %.0fs in regular hours (from 09:31 ET)", interval)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                _n = datetime.now(ET)
+                if not _is_regular_market_hours() or (_n.hour * 60 + _n.minute) < 9 * 60 + 31:
+                    continue
+                await self._intraday_time_exit_pass(load_ledger())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("exit_timer pass failed")
+    # EXIT-TIMER END
+
+    async def _intraday_time_exit_pass_inner(self, ledger: Any) -> None:
         if not _is_regular_market_hours():
             # Same reasoning as the loser sweep: every exit below cancels
             # the position's resting protective order and replaces it with
@@ -2296,6 +2324,15 @@ class botV3:
 
     async def run_once(self, paper_only: bool = True) -> dict[str, Any]:
         self._reset_cycle_cache()
+        if not getattr(self, "_exit_timer_started", False):  # EXIT-TIMER
+            self._exit_timer_started = True
+            try:
+                import os as _os
+                _iv = float(_os.environ.get("EXIT_PASS_INTERVAL_SECONDS", "0") or 0)
+            except Exception:
+                _iv = 0.0
+            if _iv > 0:
+                self._exit_timer_task = asyncio.create_task(self._exit_timer_loop(max(_iv, 15.0)))
         self._open_positions_cache = None
         _now = datetime.now(ET)
         if self._session_date is None or self._session_date != _now.date():
