@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import pathlib
@@ -310,9 +311,74 @@ def _order_ctx(payload) -> str:
         return "ctx_unavailable"
 
 
+# STRAY-SELL-GUARD BEGIN
+# MYRG (9/28) was shorted by accident: a plain stop sell was posted after the long
+# had already been closed, and the account (shorting allowed) accepted it as a new
+# short that then sat open for weeks. Alpaca will not refuse such a sell, so the
+# check is done here, in the one function every order goes through.
+# Switch off without a redeploy: STRAY_SELL_GUARD=0.
+_SHORT_OPEN_CTX: contextvars.ContextVar = contextvars.ContextVar("short_open", default=False)
+
+
+def _stray_guard_on() -> bool:
+    import os
+    return str(os.environ.get("STRAY_SELL_GUARD", "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+async def _long_position_qty(symbol: str) -> Optional[float]:
+    """Shares held long (negative = short). 0.0 when no position. None if unknown."""
+    try:
+        resp = await _request("GET", f"{ALPACA_BASE_URL}/v2/positions/{symbol}")
+        if resp.status_code == 200:
+            return float(resp.json().get("qty") or 0)
+        if resp.status_code == 404:
+            return 0.0
+        return None
+    except Exception:
+        return None
+
+
+async def _blocked_stray_sell(payload: dict) -> bool:
+    if not isinstance(payload, dict) or not _stray_guard_on():
+        return False
+    side = payload.get("side")
+    if str(getattr(side, "value", side)).lower() != "sell":
+        return False
+    if _SHORT_OPEN_CTX.get():
+        return False  # a deliberate short entry
+    oc = payload.get("order_class")
+    if str(getattr(oc, "value", oc) or "").lower() in ("bracket", "oto", "oco"):
+        return False
+    symbol = str(payload.get("symbol", "")).upper()
+    if not symbol:
+        return False
+    otype = payload.get("type") or payload.get("order_type")
+    if str(getattr(otype, "value", otype) or "").lower() == "stop":
+        logger.info("plain_stop_sell_post %s", _order_ctx(payload))
+    qty = await _long_position_qty(symbol)
+    if qty is not None and qty <= 0:
+        await asyncio.sleep(1.0)  # a just-filled buy can take a moment to show as a position
+        qty = await _long_position_qty(symbol)
+    if qty is None or qty > 0:
+        return False
+    logger.warning("stray_sell_blocked no long position (qty=%s) | ctx=%s", qty, _order_ctx(payload))
+    return True
+# STRAY-SELL-GUARD END
+
+
 async def _post_order(payload: dict) -> Optional[dict]:
     url = f"{ALPACA_BASE_URL}/v2/orders"
     retryable_statuses = {429, 500, 502, 503, 504}
+
+    if hasattr(payload, "model_dump"):
+        payload = payload.model_dump(exclude_none=True)
+    elif hasattr(payload, "dict"):
+        payload = payload.dict(exclude_none=True)
+    try:
+        if await _blocked_stray_sell(payload):
+            return None
+    except Exception:
+        logger.exception("stray sell guard failed (order allowed)")
 
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
@@ -973,7 +1039,11 @@ async def place_market_short(
             "time_in_force": "gtc",
         }
 
-    result = await _post_order(payload)
+    _tok = _SHORT_OPEN_CTX.set(True)
+    try:
+        result = await _post_order(payload)
+    finally:
+        _SHORT_OPEN_CTX.reset(_tok)
     if result:
         return result.get("id"), float(result.get("filled_avg_price") or 0) or None
     return None, None
@@ -1406,6 +1476,68 @@ async def monitor_position_protection(interval_seconds: int = 7200) -> None:
         except Exception:
             logger.exception("Protection sweep failed")
 
+# STRAY-SHORT-WATCHDOG BEGIN
+# A short the bot did not open on purpose (no open short entry in the ledger) is
+# covered at market. Seen on several polls in a row first, because a new short's
+# ledger entry is written a little after the fill. Off with STRAY_SHORT_COVER=0.
+_STRAY_SHORT_SEEN: dict[str, int] = {}
+_STRAY_SHORT_POLLS = 6  # x 30 s = about 3 minutes
+
+
+def _open_short_symbols() -> Optional[set]:
+    try:
+        from backend.services.trade_ledger_service import load_ledger
+        led = load_ledger()
+    except Exception:
+        return None
+    if not led:
+        return None  # unreadable or empty ledger: do not guess
+    out: set = set()
+    for sym, entries in led.items():
+        for e in entries if isinstance(entries, list) else []:
+            if not isinstance(e, dict) or e.get("status") != "open":
+                continue
+            if str(e.get("side", "")).lower() in ("short", "sell") or (e.get("metadata") or {}).get("short"):
+                out.add(str(sym).upper())
+    return out
+
+
+async def _cover_stray_shorts(positions: list) -> None:
+    import os
+    if str(os.environ.get("STRAY_SHORT_COVER", "1")).strip().lower() in ("0", "false", "no", "off"):
+        return
+    shorts = {}
+    for pos in positions:
+        try:
+            q = float(pos.get("qty") or 0)
+        except Exception:
+            continue
+        if q < 0:
+            shorts[str(pos.get("symbol", "")).upper()] = q
+    for sym in list(_STRAY_SHORT_SEEN):
+        if sym not in shorts:
+            _STRAY_SHORT_SEEN.pop(sym, None)
+    if not shorts:
+        return
+    deliberate = _open_short_symbols()
+    if deliberate is None:
+        return
+    for sym, q in shorts.items():
+        if sym in deliberate:
+            _STRAY_SHORT_SEEN.pop(sym, None)
+            continue
+        n = _STRAY_SHORT_SEEN.get(sym, 0) + 1
+        _STRAY_SHORT_SEEN[sym] = n
+        if n < _STRAY_SHORT_POLLS:
+            continue
+        logger.warning("stray_short_cover symbol=%s qty=%s — no open short entry in the ledger, covering at market", sym, q)
+        try:
+            await place_market_cover(sym, abs(q))
+        except Exception:
+            logger.exception("stray_short_cover failed for %s", sym)
+# STRAY-SHORT-WATCHDOG END
+
+
 async def monitor_hard_stops(poll_interval: int = HARD_STOP_POLL_INTERVAL):
     """
     Background loop: polls every 30s.
@@ -1434,6 +1566,10 @@ async def monitor_hard_stops(poll_interval: int = HARD_STOP_POLL_INTERVAL):
                 await asyncio.sleep(poll_interval)
                 continue
             positions = await _get_open_positions()
+            try:
+                await _cover_stray_shorts(positions)
+            except Exception:
+                logger.exception("stray short watchdog failed")
             for pos in positions:
                 symbol = pos.get("symbol")
                 try:

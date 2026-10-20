@@ -38,16 +38,77 @@ from backend.services.bars_service import get_bars
 from backend.services.account_service import get_account_buying_power
 from backend.services.trade_ledger_service import (
     add_entry,
-    close_entry,
+    close_entry as _ledger_close_entry,
     is_in_cooldown,
     load_ledger,
-    save_ledger,
+    save_ledger as _ledger_save_ledger,
     _from_iso,
 )
 from backend.agents.tradetiq_agent import TradetiqAgent
 
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
+
+# CLOSE-REGISTRY BEGIN
+# The exit timer (and any other pass that closes a ledger entry on its own copy of
+# the ledger) used to leave the entry "open" on disk: the main loop later saved its
+# own stale copy and the reconcile step tagged the position "alpaca_exit". Every
+# close made through close_entry() is now remembered here, and every save_ledger()
+# re-applies the closes it is missing, so a close can no longer be overwritten.
+import time as _time_mod
+
+_RECENT_CLOSES: list[dict[str, Any]] = []
+_CLOSE_SEQ: list[int] = [0]
+_CLOSE_KEEP_SECONDS = 12 * 3600
+_CLOSE_FIELDS = ("status", "exit_price", "close_order_id", "close_reason", "closed_at", "last_action_at", "cooldown_until")
+
+
+def close_entry(ledger, *args, **kwargs):
+    entry = _ledger_close_entry(ledger, *args, **kwargs)
+    try:
+        if entry is not None:
+            _RECENT_CLOSES.append({
+                "symbol": entry.get("symbol"),
+                "created_at": entry.get("created_at"),
+                "entry_order_id": entry.get("order_id"),
+                "fields": {k: entry.get(k) for k in _CLOSE_FIELDS},
+                "ts": _time_mod.time(),
+            })
+            _CLOSE_SEQ[0] += 1
+    except Exception:
+        logger.exception("close registry record failed")
+    return entry
+
+
+def _reapply_recent_closes(ledger: Any) -> int:
+    cutoff = _time_mod.time() - _CLOSE_KEEP_SECONDS
+    _RECENT_CLOSES[:] = [r for r in _RECENT_CLOSES if r["ts"] >= cutoff]
+    fixed = 0
+    for r in _RECENT_CLOSES:
+        entries = ledger.get(r["symbol"]) if isinstance(ledger, dict) else None
+        if not isinstance(entries, list):
+            continue
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            if e.get("created_at") != r["created_at"] or e.get("order_id") != r["entry_order_id"]:
+                continue
+            if e.get("status") == "open" or e.get("close_reason") == "alpaca_exit":
+                if e.get("close_reason") != r["fields"].get("close_reason") or e.get("status") != "closed":
+                    e.update(r["fields"])
+                    fixed += 1
+    return fixed
+
+
+def save_ledger(ledger):
+    try:
+        n = _reapply_recent_closes(ledger)
+        if n:
+            logger.info("ledger_close_reapplied entries=%d", n)
+    except Exception:
+        logger.exception("reapply recent closes failed")
+    _ledger_save_ledger(ledger)
+# CLOSE-REGISTRY END
 
 _PENDING_SELLS: set[str] = set()
 _PENDING_BUYS: set[str] = set()
@@ -1505,7 +1566,12 @@ class botV3:
                 _n = datetime.now(ET)
                 if not _is_regular_market_hours() or (_n.hour * 60 + _n.minute) < 9 * 60 + 31:
                     continue
+                _seq0 = _CLOSE_SEQ[0]
                 await self._intraday_time_exit_pass(load_ledger())
+                if _CLOSE_SEQ[0] != _seq0:
+                    # Persist the closes on a fresh read of the ledger (no awaits
+                    # between the read and the write, so nothing can interleave).
+                    save_ledger(load_ledger())
             except asyncio.CancelledError:
                 raise
             except Exception:
