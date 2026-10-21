@@ -268,7 +268,26 @@ def load_tradable_equities() -> list[str]:
 
     client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING)
     req = GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY)
-    assets = client.get_all_assets(req)
+    try:
+        assets = client.get_all_assets(req)
+    except Exception as exc:
+        # alpaca-py validates every asset against a fixed list of exchanges, so one
+        # asset on a new exchange (TXSE, 10/20/2026) rejects the whole list and the
+        # bot crashes at import. Read the raw list instead and skip nothing.
+        import logging as _logging
+        from types import SimpleNamespace as _NS
+        _logging.getLogger(__name__).warning("get_all_assets failed (%s) - reading the raw asset list", type(exc).__name__)
+        raw = client.get("/assets", req.to_request_fields())
+        assets = []
+        for d in raw if isinstance(raw, list) else []:
+            if not isinstance(d, dict):
+                continue
+            try:
+                st = AssetStatus(str(d.get("status", "")).lower())
+            except Exception:
+                st = d.get("status")
+            assets.append(_NS(symbol=d.get("symbol"), status=st, tradable=d.get("tradable", False),
+                              fractionable=d.get("fractionable", False)))
 
     symbols: list[str] = []
     for asset in assets:
