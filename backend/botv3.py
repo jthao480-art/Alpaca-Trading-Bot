@@ -1960,6 +1960,14 @@ class botV3:
                     "score": score,
                     "confidence": confidence,
                     "priority": trade_priority(signal),
+                    # THIS candidate's own volume readings. The buy loop used to write
+                    # whatever volume_ratio/acceleration/slope the signal loop had left
+                    # over from the LAST symbol it processed into every ledger entry.
+                    "vol": {
+                        "volume_ratio": float(volume_ratio or metadata.get("relative_volume") or 0.0),
+                        "volume_acceleration": float(volume_acceleration or 0.0),
+                        "volume_slope": float(volume_slope or 0.0),
+                    },
                 })
             elif direction == "sell" and open_qty == 0:
                 if not getattr(config, "ENABLE_SHORTS", False):
@@ -2045,6 +2053,7 @@ class botV3:
             confidence = float(item["confidence"])
             priority = float(item.get("priority", 0.0) or 0.0)
             metadata = signal.get("metadata", {}) or {}
+            _cv = item.get("vol") or {}
             _is_tradetiq_buy = str(signal.get("agent", "")).lower() == "tradetiq"
             _tradetiq_category = str(metadata.get("category", "")).lower() or (
                 "provisional" if str(metadata.get("signal_type", "")).lower().endswith("_provisional") else "eod"
@@ -2204,9 +2213,9 @@ class botV3:
                         "exit_stop_loss_pct": exit_plan["stop_loss_pct"],
                         "use_trailing": exit_plan["use_trailing"],
                         "trailing_stop_pct": exit_plan["trailing_stop_pct"],
-                        "volume_ratio": volume_ratio,
-                        "volume_acceleration": volume_acceleration,
-                        "volume_slope": volume_slope,
+                        "volume_ratio": float(_cv.get("volume_ratio", 0.0) or 0.0),
+                        "volume_acceleration": float(_cv.get("volume_acceleration", 0.0) or 0.0),
+                        "volume_slope": float(_cv.get("volume_slope", 0.0) or 0.0),
                         "agent": str(signal.get("agent", "unknown")),
                         "signal_direction": str(signal.get("direction", "")),
                         "news_confidence": float(metadata.get("news_confidence", 0.0) or 0.0),
@@ -2218,6 +2227,12 @@ class botV3:
                         "spy_trend_up": spy_trend_up,
                         "news_label": str(metadata.get("news_label", "neutral")),
                         "breakout": bool(metadata.get("breakout", False)),
+                        # how far the price moved between the scan and our fill (signal lateness)
+                        "ent_scan_price": float(metadata.get("current_price", 0.0) or 0.0),
+                        "ent_order_price": float(price),
+                        "ent_slip_pct": round(
+                            ((float(fill_price or price) / float(metadata.get("current_price") or price)) - 1.0) * 100.0, 3
+                        ) if float(metadata.get("current_price") or 0.0) > 0 else None,
                         **metadata,
                     },
                 )

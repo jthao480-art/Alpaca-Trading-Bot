@@ -304,7 +304,44 @@ def _curve_fraction(curve: list[float], now_et: datetime) -> float:
     return curve[k] + (curve[k + 1] - curve[k]) * within
 
 
-async def _wave_relative_volume_fast(daily_bars: list[dict]) -> tuple[Optional[float], int]:
+_PRIOR_VOL_CACHE: dict[tuple, list[float]] = {}
+
+
+async def _prior_daily_volumes(symbol: str, today_iso: str) -> list[float]:
+    """Prior sessions' daily volumes (oldest -> newest, today excluded), fetched once per
+    symbol per ET day. The shared daily-bar fetch only reaches back 14 calendar days
+    (~10 sessions), which is fewer than the 14 Wave needs, so in curve mode Wave's
+    relative volume was always None. Only called for stocks already down >=1% from the
+    open (a few dozen a day), so this adds very few data requests."""
+    key = (symbol, today_iso)
+    if key in _PRIOR_VOL_CACHE:
+        return _PRIOR_VOL_CACHE[key]
+    if len(_PRIOR_VOL_CACHE) > 5000:
+        _PRIOR_VOL_CACHE.clear()
+    vols: list[float] = []
+    try:
+        from backend.services.bars_service import _service, _default_window
+        start, end = _default_window(int(os.getenv("WAVE_PRIOR_DAYS", "45")))
+        payload = await _service.get_bars(symbol, start, end, timeframe="1Day", limit=60)
+        bars = (payload.get("bars") or []) if isinstance(payload, dict) else []
+        rows = []
+        for b in bars:
+            try:
+                d = datetime.fromisoformat(str(b.get("t")).replace("Z", "+00:00")).astimezone(ET).date().isoformat()
+                rows.append((d, float(b.get("v") or 0)))
+            except Exception:
+                continue
+        rows.sort()
+        vols = [v for d, v in rows if d != today_iso]
+    except Exception:
+        # do not cache a failed fetch (e.g. a 429): let the next pass retry it
+        logging.getLogger(__name__).warning("wave prior-volume fetch failed for %s", symbol)
+        return []
+    _PRIOR_VOL_CACHE[key] = vols
+    return vols
+
+
+async def _wave_relative_volume_fast(daily_bars: list[dict], symbol: Optional[str] = None) -> tuple[Optional[float], int]:
     """(relative_volume or None, prior_sessions_used) from the daily bars already in hand."""
     now_et = datetime.now(ET)
     try:
@@ -314,6 +351,10 @@ async def _wave_relative_volume_fast(daily_bars: list[dict]) -> tuple[Optional[f
             return None, 0                      # no trade yet today -> stale bar
         today_vol = float(last.get("v") or 0)
         prior = [float(b.get("v") or 0) for b in daily_bars[:-1]][-WAVE_REL_VOL_LOOKBACK_DAYS:]
+        if symbol and len([v for v in prior if v]) < _WAVE_MIN_PRIOR_SESSIONS:
+            deeper = await _prior_daily_volumes(symbol, now_et.date().isoformat())
+            if len([v for v in deeper if v]) > len([v for v in prior if v]):
+                prior = deeper[-WAVE_REL_VOL_LOOKBACK_DAYS:]
         frac = _curve_fraction(await _wave_curve(), now_et)
         if today_vol <= 0 or frac < 0.05 or len([v for v in prior if v]) < _WAVE_MIN_PRIOR_SESSIONS:
             return None, len(prior)
@@ -414,7 +455,7 @@ class IntradayAgent(BaseAgent):
                 if os.getenv("WAVE_REL_VOL_MODE", "curve").strip().lower() == "history":
                     rel_vol, wave_baseline_days = await _wave_relative_volume_from_history(symbol)
                 else:
-                    rel_vol, wave_baseline_days = await _wave_relative_volume_fast(daily_bars)
+                    rel_vol, wave_baseline_days = await _wave_relative_volume_fast(daily_bars, symbol)
 
             # ── Run all 4 checks — each individually toggleable via Railway
             # Variables (USE_RIPPLE / USE_ARES_PROVISIONAL / USE_WAVE_PROVISIONAL /
