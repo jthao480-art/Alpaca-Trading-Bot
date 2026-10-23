@@ -45,6 +45,7 @@ from zoneinfo import ZoneInfo
 from backend.execution import (
     TRAIL_PCT,
     _cancel_all_open_sell_orders,
+    _cancel_order_by_id,
     _get_open_orders_for_symbol,
     _get_open_positions,
     _post_order,
@@ -57,6 +58,7 @@ from backend.services.trade_ledger_service import close_entry, load_ledger, save
 logger = logging.getLogger(__name__)
 _ET = ZoneInfo("America/New_York")
 _STATE: dict[str, dict] = {}
+_FAST = [False]
 
 
 def _f(name: str, default: float) -> float:
@@ -110,6 +112,18 @@ def _save_meta(sym: str, value) -> None:
         md.pop("pm_tp", None)
     else:
         md["pm_tp"] = value
+    save_ledger(led)
+
+
+def _update_meta(sym: str, **kw) -> None:
+    led = load_ledger()
+    e = _open_entry(led, sym)
+    if e is None:
+        return
+    md = e.setdefault("metadata", {})
+    cur = dict(md.get("pm_tp") or {})
+    cur.update(kw)
+    md["pm_tp"] = cur
     save_ledger(led)
 
 
@@ -185,7 +199,8 @@ async def _place(sym: str, p: dict, e: dict, dry: bool) -> None:
     res = await _post_order({"symbol": sym, "qty": qs, "side": "sell", "type": "limit", "limit_price": str(px),
                              "time_in_force": "day", "extended_hours": True})
     if res and res.get("id"):
-        _STATE[sym] = {"id": res.get("id"), "plan": {"stop": stop, "trail": trail, "qty": qty}}
+        _STATE[sym] = {"id": res.get("id"), "plan": {"stop": stop, "trail": trail, "qty": qty, "order": res.get("id")}}
+        _update_meta(sym, order=res.get("id"))
         logger.warning("PM TP %s order placed id=%s", sym, res.get("id"))
     else:
         logger.error("PM TP %s order NOT placed - putting protection back", sym)
@@ -193,18 +208,47 @@ async def _place(sym: str, p: dict, e: dict, dry: bool) -> None:
         _save_meta(sym, None)
 
 
-async def _restore(sym: str, qty: float, plan: dict) -> bool:
-    """cancel the take-profit and put protection back (see module docstring, step 2)."""
-    await _cancel_all_open_sell_orders(sym)
+_SELL_DONE = {"filled", "canceled", "rejected", "expired", "done_for_day", "replaced"}
+
+
+async def _open_sells(sym: str) -> list[dict]:
+    return [o for o in await _get_open_orders_for_symbol(sym)
+            if str(o.get("side", "")).lower() == "sell" and str(o.get("status", "")).lower() not in _SELL_DONE]
+
+
+async def _restore(sym: str, qty: float, plan: dict, cur: float | None = None) -> bool:
+    """Take the take-profit limit off and put protection back - touching ONLY our own order.
+
+    Anything else already working on the position (the exit timer's market sell, a stop that
+    something else placed) is left alone: the position is being handled, we must not cancel it."""
+    mine = plan.get("order") or (_STATE.get(sym) or {}).get("id")
+    if mine:
+        await _cancel_order_by_id(str(mine))
+    else:  # no id on record (ledger copy lost): cancel only extended-hours LIMIT sells
+        for o in await _open_sells(sym):
+            if str(o.get("type", "")).lower() == "limit":
+                await _cancel_order_by_id(str(o.get("id")))
+    others = []
+    for _ in range(6):  # wait until our order is really gone
+        others = await _open_sells(sym)
+        if not any(str(o.get("id")) == str(mine) for o in others) and not (
+                not mine and any(str(o.get("type", "")).lower() == "limit" for o in others)):
+            break
+        await asyncio.sleep(0.5)
+    others = [o for o in others if str(o.get("id")) != str(mine)]
+    if others:
+        logger.warning("PM TP %s: another sell order is already working (%s) - leaving it, no stop added", sym,
+                       ",".join(sorted({str(o.get("type", "?")) for o in others})))
+        return True
     stop, old_trail = plan.get("stop"), plan.get("trail")
-    cur = None
-    try:
-        for p in await _get_open_positions():
-            if str(p.get("symbol")) == sym:
-                cur = float(p.get("current_price") or 0)
-                qty = float(p.get("qty") or qty)
-    except Exception:
-        pass
+    if cur is None:
+        try:
+            for p in await _get_open_positions():
+                if str(p.get("symbol")) == sym:
+                    cur = float(p.get("current_price") or 0)
+                    qty = float(p.get("qty") or qty)
+        except Exception:
+            pass
     if qty <= 0:
         return True
     if stop and cur and cur <= stop:
@@ -238,6 +282,7 @@ async def _pass() -> None:
     for s_, st_ in _STATE.items():  # placed this run, even if the ledger copy was overwritten
         if st_.get("plan") and not st_.get("restored") and s_ not in pending:
             pending.append(s_)
+    _FAST[0] = bool(pending) and open_s - 60 <= sec <= open_s + 900
     can_place = _f("PM_TP_PLACE_FROM_MIN", 245) <= mins < _f("PM_TP_PLACE_UNTIL_MIN", 560)
     restore_due = sec >= open_s + _f("PM_TP_RESTORE_SECONDS", 10) and sec < 16 * 3600 + 600
     if not can_place and not pending:
@@ -255,25 +300,40 @@ async def _pass() -> None:
     if not dry:
         _reconcile(set(pos))
         led = load_ledger()
-    # ---- restore protection ----
-    if restore_due:
+    # ---- restore protection (all positions at once, a few in parallel) ----
+    if restore_due and pending:
+        sem = asyncio.Semaphore(6)
+
+        async def _one(sym: str, p: dict, e) -> None:
+            plan = dict(((e or {}).get("metadata") or {}).get("pm_tp") or _STATE.get(sym, {}).get("plan") or {})
+            async with sem:
+                try:
+                    ok = await _restore(sym, float(p.get("qty") or 0), plan, float(p.get("current_price") or 0) or None)
+                except Exception:
+                    logger.exception("pm_tp: restore failed for %s", sym)
+                    ok = False
+            if ok:
+                plan["restored"] = True
+                _STATE.setdefault(sym, {})["restored"] = True
+                if e is not None:
+                    _save_meta(sym, plan)
+
+        jobs = []
         for sym in pending:
             p = pos.get(sym)
             e = _open_entry(led, sym)
             if p is None:
                 _STATE.pop(sym, None)
                 continue
-            plan = dict(((e or {}).get("metadata") or {}).get("pm_tp") or _STATE.get(sym, {}).get("plan") or {})
-            if _STATE.get(sym, {}).get("restore_try", 0) > 0 and time.time() - _STATE[sym]["restore_try"] < 20:
+            last = _STATE.get(sym, {}).get("restore_try", 0)
+            if last and time.time() - last < 10:
                 continue
             _STATE.setdefault(sym, {})["restore_try"] = time.time()
             if dry:
                 continue
-            if await _restore(sym, float(p.get("qty") or 0), plan):
-                plan["restored"] = True
-                _STATE.setdefault(sym, {})["restored"] = True
-                if e is not None:
-                    _save_meta(sym, plan)
+            jobs.append(_one(sym, p, e))
+        if jobs:
+            await asyncio.gather(*jobs)
     # ---- place take-profits ----
     if not can_place:
         return
@@ -321,4 +381,4 @@ async def monitor_premarket_tp() -> None:
             raise
         except Exception:
             logger.exception("pm_tp pass failed")
-        await asyncio.sleep(poll)
+        await asyncio.sleep(5.0 if _FAST[0] else poll)
