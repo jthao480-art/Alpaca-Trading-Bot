@@ -128,6 +128,60 @@ _MAX_SELL_ATTEMPTS: int = 3
 # stale/empty result and wrongly conclude the position has no protection.
 _PROTECT_GRACE_SECONDS: float = float(getattr(config, "PROTECT_GRACE_SECONDS", 45))
 
+_TOPUP_LAST: dict[str, float] = {}
+_TOPUP_COOLDOWN_SECONDS = 300.0
+
+
+async def _top_up_stop_cover(symbol: str, qty: float, orders: list[dict], trail_pct: float) -> bool:
+    """A long position already has a stop, but the stop(s) may cover only part
+    of the shares (e.g. a restore after the open re-attached a stop for the
+    shares that were free at that moment while a market sell held the rest and
+    then got cancelled/rejected). Attach a trailing stop for the uncovered
+    remainder.
+
+    Deliberately conservative: only acts when the order list was read OK and
+    holds nothing but plain stop / trailing-stop sells (no brackets, limits or
+    market sells, which are exits in flight), only for whole shares, and at
+    most once per symbol per cooldown."""
+    import os as _os_mod
+    try:
+        if _os_mod.getenv("STOP_TOPUP_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
+            return False
+        if qty < 1 or not orders:
+            return False
+        held = 0.0
+        for o in orders:
+            if str(o.get("side", "")).lower() != "sell":
+                continue
+            otype = str(o.get("type", "")).lower()
+            if otype not in ("trailing_stop", "stop"):
+                return False
+            if o.get("legs") or str(o.get("order_class", "")).lower() in ("bracket", "oco", "oto"):
+                return False
+            try:
+                held += max(0.0, float(o.get("qty") or 0) - float(o.get("filled_qty") or 0))
+            except Exception:
+                return False
+        missing = qty - held
+        if held <= 0 or missing < 1.0:
+            return False
+        now = _time_mod.time()
+        if now - _TOPUP_LAST.get(symbol, 0.0) < _TOPUP_COOLDOWN_SECONDS:
+            return False
+        _TOPUP_LAST[symbol] = now
+        logger.warning("Long %s — stops cover %.0f of %.0f shares; attaching trailing stop for the other %.0f",
+                       symbol, held, qty, missing)
+        # place_trailing_stop_sell sizes itself as (requested - held), so pass
+        # the full position quantity, not the missing part.
+        trail_id = await place_trailing_stop_sell(symbol, qty, trail_percent=trail_pct)
+        if trail_id:
+            logger.info("Long %s — stop top-up placed (%s)", symbol, trail_id)
+            return True
+        logger.warning("Long %s — stop top-up failed (will retry after cooldown)", symbol)
+    except Exception:
+        logger.exception("stop top-up failed for %s", symbol)
+    return False
+
 
 _VOLUME_FADE_STATE: dict[str, dict[str, float]] = {}
 
@@ -1275,6 +1329,8 @@ class botV3:
                                 logger.error("Long %s — UNPROTECTED: trailing stop AND hard stop fallback both failed (qty=%s)", symbol, qty)
                     else:
                         logger.warning("Long %s — trailing stop failed, hard stop still active", symbol)
+            elif not _is_long_hold:
+                await _top_up_stop_cover(symbol, qty, orders, _entry_trail or 5.0)
         elif qty < 0:
             has_trailing = any(t == "trailing_stop" for t, s in zip(order_types, order_sides) if s == "buy")
             has_hard_stop = any(t == "stop" for t, s in zip(order_types, order_sides) if s == "buy")

@@ -42,13 +42,19 @@ import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import TrailingStopOrderRequest
+
 from backend.execution import (
+    ALPACA_BASE_URL,
     TRAIL_PCT,
     _cancel_all_open_sell_orders,
     _cancel_order_by_id,
     _get_open_orders_for_symbol,
     _get_open_positions,
     _post_order,
+    _request,
+    open_stops,
     place_trailing_stop_sell,
 )
 from backend import news_watch as _nw
@@ -211,31 +217,78 @@ async def _place(sym: str, p: dict, e: dict, dry: bool) -> None:
 _SELL_DONE = {"filled", "canceled", "rejected", "expired", "done_for_day", "replaced"}
 
 
-async def _open_sells(sym: str) -> list[dict]:
-    return [o for o in await _get_open_orders_for_symbol(sym)
-            if str(o.get("side", "")).lower() == "sell" and str(o.get("status", "")).lower() not in _SELL_DONE]
+_BULK: dict = {"t": 0.0, "data": None, "lock": None, "blocked_until": 0.0}
+
+
+async def _bulk_open_sells(max_age: float = 1.0) -> dict | None:
+    """Every open SELL order on the account keyed by symbol, from ONE request that all the
+    restores running at the same moment share (at most one fetch per max_age seconds).
+    Returns None when the orders could not be read (rate limit etc.) - callers must treat that
+    as 'unknown', never as 'no orders': the old per-symbol lookup swallowed a 429 as an empty
+    list, which made the bot place a stop on shares another order was already holding."""
+    if _BULK["lock"] is None:
+        _BULK["lock"] = asyncio.Lock()
+    async with _BULK["lock"]:
+        now = time.time()
+        if _BULK["data"] is not None and now - _BULK["t"] < max_age:
+            return _BULK["data"]
+        if now < _BULK["blocked_until"]:
+            return None
+        try:
+            resp = await _request("GET", f"{ALPACA_BASE_URL}/v2/orders",
+                                  params={"status": "open", "limit": 500, "nested": "false"})
+            if resp.status_code != 200:
+                if resp.status_code == 429:
+                    _BULK["blocked_until"] = time.time() + 2.0
+                logger.warning("PM TP: could not read open orders (%s) - will retry", resp.status_code)
+                _BULK["data"] = None
+                return None
+            rows = resp.json()
+            out: dict[str, list[dict]] = {}
+            for o in rows if isinstance(rows, list) else []:
+                if str(o.get("side", "")).lower() == "sell" and str(o.get("status", "")).lower() not in _SELL_DONE:
+                    out.setdefault(str(o.get("symbol")), []).append(o)
+            _BULK["data"], _BULK["t"] = out, time.time()
+            return out
+        except Exception:
+            logger.exception("PM TP: open-order read failed")
+            _BULK["data"] = None
+            return None
+
+
+async def _open_sells(sym: str) -> list[dict] | None:
+    snap = await _bulk_open_sells()
+    return None if snap is None else list(snap.get(sym, []))
 
 
 async def _restore(sym: str, qty: float, plan: dict, cur: float | None = None) -> bool:
     """Take the take-profit limit off and put protection back - touching ONLY our own order.
 
     Anything else already working on the position (the exit timer's market sell, a stop that
-    something else placed) is left alone: the position is being handled, we must not cancel it."""
+    something else placed) is left alone: the position is being handled, we must not cancel it.
+    Uses one shared order list (see _bulk_open_sells) and a single order post, so restoring 30
+    positions at the open costs ~70 requests instead of ~300 and no longer trips Alpaca's
+    200/min limit."""
     mine = plan.get("order") or (_STATE.get(sym) or {}).get("id")
     if mine:
         await _cancel_order_by_id(str(mine))
     else:  # no id on record (ledger copy lost): cancel only extended-hours LIMIT sells
-        for o in await _open_sells(sym):
+        for o in (await _open_sells(sym)) or []:
             if str(o.get("type", "")).lower() == "limit":
                 await _cancel_order_by_id(str(o.get("id")))
-    others = []
-    for _ in range(6):  # wait until our order is really gone
-        others = await _open_sells(sym)
-        if not any(str(o.get("id")) == str(mine) for o in others) and not (
-                not mine and any(str(o.get("type", "")).lower() == "limit" for o in others)):
-            break
-        await asyncio.sleep(0.5)
-    others = [o for o in others if str(o.get("id")) != str(mine)]
+    others = None
+    for _ in range(12):  # wait (up to ~12 s) until our order is really gone
+        cur_orders = await _open_sells(sym)
+        if cur_orders is not None:
+            gone = (not any(str(o.get("id")) == str(mine) for o in cur_orders)) if mine else (
+                not any(str(o.get("type", "")).lower() == "limit" for o in cur_orders))
+            if gone:
+                others = [o for o in cur_orders if str(o.get("id")) != str(mine)]
+                break
+        await asyncio.sleep(1.0)
+    if others is None:
+        logger.warning("PM TP %s: cancel not confirmed / orders unreadable (rate limit?) - will retry", sym)
+        return False
     if others:
         logger.warning("PM TP %s: another sell order is already working (%s) - leaving it, no stop added", sym,
                        ",".join(sorted({str(o.get("type", "?")) for o in others})))
@@ -259,8 +312,13 @@ async def _restore(sym: str, qty: float, plan: dict, cur: float | None = None) -
     trail = base
     if stop and cur and cur > stop:
         trail = max(0.5, min(base, (cur - stop) / cur * 100.0))
-    tid = await place_trailing_stop_sell(sym, qty, trail)
+    # One direct post: the position and the absence of other sell orders were just verified above.
+    res = await _post_order(TrailingStopOrderRequest(
+        symbol=sym, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC, trail_percent=float(trail)))
+    tid = res.get("id") if isinstance(res, dict) else None
     if tid:
+        open_stops.setdefault(sym, {})["trail"] = str(tid)
+        _BULK["t"] = 0.0  # force the next read to include the stop we just added
         logger.warning("PM TP %s protection restored: trailing stop %.2f%% id=%s (old stop %s)", sym, trail, tid, stop)
         return True
     logger.error("PM TP %s could not restore the trailing stop - will retry", sym)
