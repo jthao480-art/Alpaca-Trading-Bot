@@ -144,6 +144,16 @@ NEWS_BUY_MAX_TRADE_AGE_SECONDS = float(_env.get("NEWS_BUY_MAX_TRADE_AGE_SECONDS"
 NEWS_BUY_NEG_LOOKBACK_HOURS = float(_env.get("NEWS_BUY_NEG_LOOKBACK_HOURS", "6"))
 NEWS_BUY_REENTRY_HOURS = float(_env.get("NEWS_BUY_REENTRY_HOURS", "12"))
 NEWS_BUY_MAX_PER_DAY = int(_env.get("NEWS_BUY_MAX_PER_DAY", "4"))
+# Early-entry helpers for news-buy (both default OFF = old behaviour):
+#  NEWS_BUY_EXTRA_SLOTS: tier-A catalysts may open up to this many positions beyond
+#    MAX_POSITIONS, so a top catalyst is not blocked by a full book of ordinary scan trades.
+#  NEWS_BUY_OPEN_QUEUE_ENABLED: a tier-A catalyst that cannot be priced in pre-market/after-hours
+#    (no fresh IEX trade or quote) is queued and re-evaluated at the 9:30 open on real prices,
+#    still subject to every normal filter incl. the chase cap.
+NEWS_BUY_EXTRA_SLOTS = int(_env.get("NEWS_BUY_EXTRA_SLOTS", "0"))
+NEWS_BUY_OPEN_QUEUE_ENABLED = _env.get("NEWS_BUY_OPEN_QUEUE_ENABLED", "false").lower() == "true"
+NEWS_BUY_OPEN_QUEUE_MAX_HOURS = float(_env.get("NEWS_BUY_OPEN_QUEUE_MAX_HOURS", "18"))
+NEWS_BUY_OPEN_QUEUE_WINDOW_MIN = float(_env.get("NEWS_BUY_OPEN_QUEUE_WINDOW_MIN", "20"))
 # Sizing / exits
 NEWS_BUY_POSITION_PCT = float(_env.get("NEWS_BUY_POSITION_PCT", "2.0"))
 NEWS_BUY_MAX_POSITION_USD = float(_env.get("NEWS_BUY_MAX_POSITION_USD", "2000"))

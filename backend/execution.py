@@ -34,6 +34,9 @@ MAX_LEVERAGE = float(getattr(config, "MAX_LEVERAGE", 1.0))
 MAX_SHORT_LEVERAGE = float(getattr(config, "MAX_SHORT_LEVERAGE", 0.5))
 MAX_POSITION_SIZE = float(getattr(config, "MAX_POSITION_SIZE", getattr(config, "MAX_POSITION_SIZE_USD", 2000.0)))
 MAX_POSITIONS = int(getattr(config, "MAX_POSITIONS", 55))
+# Extra position slots granted to the current task (news-buy tier-A catalysts only; 0 elsewhere).
+import contextvars as _contextvars
+_POSITION_SLOT_BONUS: "_contextvars.ContextVar[int]" = _contextvars.ContextVar("position_slot_bonus", default=0)
 DAILY_LOSS_LIMIT = float(getattr(config, "DAILY_LOSS_LIMIT", -1000.0))
 BUYING_POWER_BUFFER = float(getattr(config, "BUYING_POWER_BUFFER", 1.1))
 POSITION_SIZE_PCT = float(getattr(config, "POSITION_SIZE_PCT", 0.05))
@@ -253,7 +256,7 @@ async def _buy_risk_check(symbol: str, qty: float, price: float) -> tuple[bool, 
             return False, "cash_reserve_floor_hit", 0.0
 
         positions = await _get_open_positions()
-        if len(positions) >= MAX_POSITIONS:
+        if len(positions) >= MAX_POSITIONS + _POSITION_SLOT_BONUS.get():
             return False, "max_positions_reached", 0.0
 
         gross_long_exposure = 0.0

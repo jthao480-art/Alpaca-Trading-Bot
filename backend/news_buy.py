@@ -573,7 +573,7 @@ async def _poll_once() -> None:
                 logger.exception("news_buy: failed evaluating %s", symbol)
 
 
-async def _consider(article: dict[str, Any], symbol: str, verdict: dict[str, Any]) -> None:
+async def _consider(article: dict[str, Any], symbol: str, verdict: dict[str, Any], from_queue: bool = False) -> None:
     head = str(article.get("headline") or "")[:120]
 
     def skip(why: str) -> None:
@@ -594,7 +594,8 @@ async def _consider(article: dict[str, Any], symbol: str, verdict: dict[str, Any
         positions = await _get_open_positions()
         if any(str(p.get("symbol", "")).upper() == symbol for p in positions):
             return skip("already held")
-        if len(positions) >= int(_cfg_f("MAX_POSITIONS", 25)):
+        _extra = int(_cfg_f("NEWS_BUY_EXTRA_SLOTS", 0)) if verdict["tier"] == "A" else 0
+        if len(positions) >= int(_cfg_f("MAX_POSITIONS", 25)) + _extra:
             return skip("position cap")
         if not await _asset_ok(symbol):
             return skip("asset not tradable / OTC")
@@ -604,6 +605,8 @@ async def _consider(article: dict[str, Any], symbol: str, verdict: dict[str, Any
             return skip("no snapshot")
         extended = not _is_regular_market_hours()
         if snap["trade_age_s"] > _cfg_f("NEWS_BUY_MAX_TRADE_AGE_SECONDS", 900.0):
+            if extended and not from_queue:
+                _queue_for_open(article, symbol, verdict, "stale last trade")
             return skip(f"last trade {snap['trade_age_s']:.0f}s old")
         if snap["price"] < _cfg_f("MIN_PRICE", 4.0):
             return skip(f"price {snap['price']:.2f} below floor")
@@ -631,13 +634,19 @@ async def _consider(article: dict[str, Any], symbol: str, verdict: dict[str, Any
         sp = snap["spread_pct"]
         if sp is None:
             if extended:
+                if not from_queue:
+                    _queue_for_open(article, symbol, verdict, "no quote")
                 return skip("no quote outside regular hours")
         elif sp > _cfg_f("NEWS_BUY_MAX_SPREAD_PCT", 1.5):
             return skip(f"spread {sp:.2f}%")
         neg = await _recent_negative(symbol)
         if neg:
             return skip(neg)
-        await _execute_buy(article, symbol, verdict, snap, buzz)
+        _tok = _ex._POSITION_SLOT_BONUS.set(_extra)
+        try:
+            await _execute_buy(article, symbol, verdict, snap, buzz)
+        finally:
+            _ex._POSITION_SLOT_BONUS.reset(_tok)
 
 
 _social_checked: dict[str, float] = {}
@@ -678,6 +687,48 @@ async def _poll_social_once() -> None:
         _social_checked.clear()
 
 
+# ── open queue ───────────────────────────────────────────────────────────────
+# Pre-market / after-hours the free IEX feed often has no fresh trade or quote for a stock, so a
+# tier-A catalyst is skipped for lack of a price. When NEWS_BUY_OPEN_QUEUE_ENABLED is on, such a
+# catalyst is remembered and re-run through _consider() just after 9:30 when real prices exist.
+_open_queue: list[dict[str, Any]] = []
+
+
+def _queue_for_open(article: dict[str, Any], symbol: str, verdict: dict[str, Any], why: str) -> None:
+    if not _cfg_b("NEWS_BUY_OPEN_QUEUE_ENABLED", False) or verdict.get("tier") != "A":
+        return
+    for q in _open_queue:
+        if q["symbol"] == symbol and str(q["article"].get("id")) == str(article.get("id")):
+            return
+    _open_queue.append({"article": article, "symbol": symbol, "verdict": verdict, "ts": datetime.now(timezone.utc)})
+    logger.info("NEWS BUY candidate %s queued for the open (%s) | tier A %s", symbol, why, verdict.get("reason"))
+
+
+async def _process_open_queue(now_et: datetime) -> None:
+    if not _open_queue:
+        return
+    max_age = timedelta(hours=_cfg_f("NEWS_BUY_OPEN_QUEUE_MAX_HOURS", 18.0))
+    cutoff = datetime.now(timezone.utc) - max_age
+    _open_queue[:] = [q for q in _open_queue if q["ts"] >= cutoff]
+    if not _open_queue or not _is_regular_market_hours():
+        return
+    minutes = now_et.hour * 60 + now_et.minute + now_et.second / 60.0
+    open_min = 9 * 60 + 30
+    if minutes < open_min + 0.15:          # let the first prints arrive (~9 s)
+        return
+    items = list(_open_queue)
+    _open_queue.clear()
+    if minutes > open_min + _cfg_f("NEWS_BUY_OPEN_QUEUE_WINDOW_MIN", 20.0):
+        logger.info("news_buy: %d queued catalyst(s) expired after the open window", len(items))
+        return
+    for q in items:
+        try:
+            logger.info("NEWS BUY re-checking queued %s at the open", q["symbol"])
+            await _consider(q["article"], q["symbol"], q["verdict"], from_queue=True)
+        except Exception:
+            logger.exception("news_buy: queued evaluation failed for %s", q["symbol"])
+
+
 async def monitor_news_buys() -> None:
     """Background task: poll the whole news stream and buy strong positive catalysts."""
     global _last_poll
@@ -701,6 +752,7 @@ async def monitor_news_buys() -> None:
             now = datetime.now(_ET)
             if _window_open(now) and await _is_trading_day(now):
                 await _poll_once()
+                await _process_open_queue(now)
                 if _cfg_b("NEWS_BUY_SOCIAL_LED_ENABLED", True) and time.time() - last_social >= social_every:
                     last_social = time.time()
                     await _poll_social_once()
