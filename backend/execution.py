@@ -62,6 +62,24 @@ def _is_regular_market_hours() -> bool:
 # ── in-memory state ───────────────────────────────────────────────────────────
 open_stops: dict[str, dict[str, str]] = {}
 _exit_locks: set[str] = set()
+
+# Callbacks fired (sync, must not raise) right after a market sell is accepted.
+# The bot registers one that re-attaches stops a few seconds later, because
+# Alpaca cancels the other positions' resting stops around a same-day sale.
+_POST_SELL_HOOKS: list = []
+
+
+def register_post_sell_hook(cb) -> None:
+    if cb not in _POST_SELL_HOOKS:
+        _POST_SELL_HOOKS.append(cb)
+
+
+def _fire_post_sell_hooks() -> None:
+    for cb in list(_POST_SELL_HOOKS):
+        try:
+            cb()
+        except Exception:
+            logger.exception("post-sell hook failed")
 _inactive_assets: set[str] = set()
 
 # Symbols bought after-hours that need trailing stops at next market open.
@@ -783,6 +801,8 @@ async def place_market_sell(symbol: str, qty: float) -> Optional[str]:
         }
 
         result = await _post_order(payload)
+        if result and result.get("id"):
+            _fire_post_sell_hooks()
         return result.get("id") if result else None
     finally:
         _exit_locks.discard(symbol)

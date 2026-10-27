@@ -128,6 +128,12 @@ _MAX_SELL_ATTEMPTS: int = 3
 # stale/empty result and wrongly conclude the position has no protection.
 _PROTECT_GRACE_SECONDS: float = float(getattr(config, "PROTECT_GRACE_SECONDS", 45))
 
+# Re-protect after sales. Alpaca cancels the OTHER positions' resting trailing
+# stops around a same-day sale (seen 4x on 2026-10-27, 9 stops each time, all in
+# one second, ~1 s before the sold position filled). The regular protect pass
+# can be 5-10 minutes away, so after any market sell we run extra passes.
+_POST_SELL_STATE: dict = {"task": None, "again": False}
+_PROTECT_LOCK: list = [None]
 _TOPUP_LAST: dict[str, float] = {}
 _TOPUP_COOLDOWN_SECONDS = 300.0
 
@@ -1364,7 +1370,62 @@ class botV3:
                     else:
                         logger.warning("Short %s — trailing stop failed, hard stop still active", symbol)
 
+    def _schedule_post_sell_protect(self) -> None:
+        """Sync hook called by execution.place_market_sell after a sell is
+        accepted. Starts (or extends) a short background re-protect run."""
+        import os as _o
+        if _o.getenv("POST_SELL_PROTECT_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
+            return
+        t = _POST_SELL_STATE.get("task")
+        if t is not None and not t.done():
+            _POST_SELL_STATE["again"] = True
+            return
+        _POST_SELL_STATE["again"] = False
+        _POST_SELL_STATE["task"] = asyncio.get_running_loop().create_task(self._post_sell_protect_run())
+
+    async def _post_sell_protect_run(self) -> None:
+        import os as _o
+        try:
+            raw = _o.getenv("POST_SELL_PROTECT_DELAYS", "6,25")
+            delays = [max(0.0, float(x)) for x in raw.split(",") if x.strip()] or [6.0, 25.0]
+        except Exception:
+            delays = [6.0, 25.0]
+        try:
+            for d in delays:
+                await asyncio.sleep(d)
+                await self._protect_positions()
+            if _POST_SELL_STATE.get("again"):
+                _POST_SELL_STATE["again"] = False
+                await asyncio.sleep(delays[0])
+                await self._protect_positions()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("post-sell protect run failed")
+
     async def _protect_positions(self) -> None:
+        """Serialised wrapper: the scan loop, the exit timer and the post-sell
+        run can all call this, and two passes at once would both see 'no stop'
+        and double-post."""
+        try:
+            from backend import execution as _exec_mod
+            _exec_mod.register_post_sell_hook(self._schedule_post_sell_protect)
+        except Exception:
+            logger.exception("could not register post-sell hook")
+        lock = _PROTECT_LOCK[0]
+        if lock is None:
+            lock = _PROTECT_LOCK[0] = asyncio.Lock()
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=90.0)
+        except asyncio.TimeoutError:
+            logger.warning("_protect_positions: another pass has run >90s; skipping this one")
+            return
+        try:
+            await self._protect_positions_inner()
+        finally:
+            lock.release()
+
+    async def _protect_positions_inner(self) -> None:
         if not _is_regular_market_hours():
             # A trailing stop or hard stop submitted here cannot fill until
             # the next regular session (Alpaca RTH rule — same one already
