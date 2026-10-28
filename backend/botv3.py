@@ -1194,7 +1194,7 @@ class botV3:
 
     async def _close_position_market(self, symbol: str, qty: float, reason: str, ledger: Any) -> None:
         try:
-            if reason in ("intraday_time_exit", "stagnant_exit", "runner_volume_fade"):
+            if reason in ("intraday_time_exit", "stagnant_exit", "runner_volume_fade", "eod_sell_winner"):
                 existing_orders = await _get_open_orders_for_symbol(symbol)
                 for o in existing_orders:
                     if str(o.get("side", "")).lower() == "sell":
@@ -1685,6 +1685,7 @@ class botV3:
                     continue
                 _seq0 = _CLOSE_SEQ[0]
                 await self._intraday_time_exit_pass(load_ledger())
+                await self._eod_sell_winners_pass()
                 if _CLOSE_SEQ[0] != _seq0:
                     # Persist the closes on a fresh read of the ledger (no awaits
                     # between the read and the write, so nothing can interleave).
@@ -1694,6 +1695,102 @@ class botV3:
             except Exception:
                 logger.exception("exit_timer pass failed")
     # EXIT-TIMER END
+
+    # EOD-SELL-WINNERS BEGIN -- a name bought TODAY that is green late in the day
+    # is the group that gives the money back overnight (history: up at 15:50 ->
+    # next-day average about -1.4%, most of them fall). Sell those, keep everything
+    # else. Off unless EOD_SELL_WINNERS=true. Window 15:50-15:57 ET (env
+    # EOD_SELL_START_MIN / EOD_SELL_END_MIN as minutes after midnight), gain
+    # threshold EOD_SELL_MIN_GAIN_PCT (default 0.3 = +0.3%). Only positions whose
+    # open ledger entries were ALL created today (ET) and that are not smarttiq/
+    # nexus long-holds. Laggards, flat names and older carries are left alone.
+    async def _eod_sell_winners_pass(self) -> None:
+        import os as _os
+        if str(_os.environ.get("EOD_SELL_WINNERS", "")).strip().lower() not in ("1", "true", "yes", "on"):
+            return
+        try:
+            _start = int(float(_os.environ.get("EOD_SELL_START_MIN", "950") or 950))
+            _end = int(float(_os.environ.get("EOD_SELL_END_MIN", "957") or 957))
+            _thr = float(_os.environ.get("EOD_SELL_MIN_GAIN_PCT", "0.3") or 0.3) / 100.0
+            _max_tries = int(float(_os.environ.get("EOD_SELL_MAX_TRIES", "3") or 3))
+            _per_tick = int(float(_os.environ.get("EOD_SELL_MAX_PER_TICK", "12") or 12))
+        except Exception:
+            return
+        now = datetime.now(ET)
+        mins = now.hour * 60 + now.minute
+        if mins < _start or mins > _end or now.weekday() >= 5:
+            return
+        if not _is_regular_market_hours():
+            return
+        st = self.__dict__.setdefault("_eod_state", {"date": None, "tries": {}})
+        if st["date"] != now.date():
+            st["date"] = now.date()
+            st["tries"] = {}
+        lock = self.__dict__.setdefault("_exit_pass_lock", asyncio.Lock())
+        if lock.locked():
+            return  # the normal exit pass is mid-flight; next tick retries
+        async with lock:
+            try:
+                positions = await _get_open_positions()
+                if not positions:
+                    return
+                ledger = load_ledger()
+                cands: list[tuple[float, str, float]] = []
+                for p in positions:
+                    symbol = p.get("symbol")
+                    try:
+                        qty = float(p.get("qty", 0) or 0)
+                        plpc = float(p.get("unrealized_plpc", 0) or 0)
+                    except Exception:
+                        continue
+                    if not symbol or qty <= 0:
+                        continue
+                    if symbol in _PENDING_SELLS or symbol in _PENDING_BUYS:
+                        continue
+                    if st["tries"].get(symbol, 0) >= _max_tries:
+                        continue
+                    if plpc < _thr:
+                        continue
+                    entries = ledger.get(symbol, [])
+                    opens = [e for e in entries if isinstance(e, dict) and e.get("status") == "open"] if isinstance(entries, list) else []
+                    if not opens:
+                        continue
+                    if any(_entry_kind(e) in _LONG_HOLD_KINDS for e in opens):
+                        continue
+                    fresh = True
+                    for e in opens:
+                        dt = _from_iso(e.get("created_at"))
+                        if dt is None or dt.astimezone(ET).date() != now.date():
+                            fresh = False
+                            break
+                    if not fresh:
+                        continue
+                    cands.append((plpc, symbol, qty))
+                if not cands:
+                    return
+                cands.sort(reverse=True)
+                for plpc, symbol, qty in cands[:_per_tick]:
+                    st["tries"][symbol] = st["tries"].get(symbol, 0) + 1
+                    logger.warning(
+                        "eod_sell_winner symbol=%s gain=%.2f%% qty=%s try=%d — selling before the close instead of carrying overnight",
+                        symbol, plpc * 100.0, qty, st["tries"][symbol],
+                    )
+                    _PENDING_SELLS.add(symbol)
+                    try:
+                        await self._close_position_market(symbol, qty, "eod_sell_winner", ledger)
+                        save_ledger(ledger)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("eod_sell_winner failed symbol=%s", symbol)
+                    finally:
+                        _PENDING_SELLS.discard(symbol)
+                    await asyncio.sleep(0.4)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("_eod_sell_winners_pass failed")
+    # EOD-SELL-WINNERS END
 
     async def _intraday_time_exit_pass_inner(self, ledger: Any) -> None:
         if not _is_regular_market_hours():
