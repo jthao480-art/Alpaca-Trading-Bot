@@ -1024,9 +1024,12 @@ async def place_market_short(
     qty: float,
     take_profit_price: Optional[float] = None,
     stop_loss_price: Optional[float] = None,
+    override: bool = False,
 ) -> Tuple[Optional[str], Optional[float]]:
-    """Place a market sell-short order with optional bracket legs."""
-    if not getattr(config, "ENABLE_SHORTS", False):
+    """Place a market sell-short order with optional bracket legs.
+    override=True lets one deliberate caller (the EOD short experiment) short while the
+    general ENABLE_SHORTS switch stays off for the scan-driven short signals."""
+    if not override and not getattr(config, "ENABLE_SHORTS", False):
         logger.info("Skipping short for %s: ENABLE_SHORTS is off", symbol)
         return None, None
     price = await get_latest_price(symbol)

@@ -1687,6 +1687,7 @@ class botV3:
                 await self._intraday_time_exit_pass(load_ledger())
                 await self._eod_sell_winners_pass()
                 await self._eod_red_open_pass()
+                await self._eod_short_cover_pass()
                 if _CLOSE_SEQ[0] != _seq0:
                     # Persist the closes on a fresh read of the ledger (no awaits
                     # between the read and the write, so nothing can interleave).
@@ -1770,6 +1771,7 @@ class botV3:
                 if not cands:
                     return
                 cands.sort(reverse=True)
+                _sold_now: list = []
                 for plpc, symbol, qty in cands[:_per_tick]:
                     st["tries"][symbol] = st["tries"].get(symbol, 0) + 1
                     logger.warning(
@@ -1779,6 +1781,7 @@ class botV3:
                     _PENDING_SELLS.add(symbol)
                     try:
                         await self._close_position_market(symbol, qty, "eod_sell_winner", ledger)
+                        _sold_now.append((symbol, qty, plpc))
                         save_ledger(ledger)
                     except asyncio.CancelledError:
                         raise
@@ -1787,6 +1790,15 @@ class botV3:
                     finally:
                         _PENDING_SELLS.discard(symbol)
                     await asyncio.sleep(0.4)
+                for _sym, _q, _pl in _sold_now:
+                    try:
+                        await self._eod_short_after_sale(_sym, _q, _pl, ledger)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("eod_short hook failed symbol=%s", _sym)
+                if _sold_now:
+                    save_ledger(ledger)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1892,6 +1904,177 @@ class botV3:
             except Exception:
                 logger.exception("_eod_red_open_pass failed")
     # EOD-RED-OPEN END
+
+    # EOD-SHORT BEGIN -- EXPERIMENT (paper only): after the 15:50 pass SELLS a green
+    # winner, flip into a short on the same name with a trailing buy-stop, and hold it
+    # with the stop for up to EOD_SHORT_MAX_DAYS trading days (cover at 15:55 ET on the
+    # last day). History (paper, 10 weeks, simulated): +$3k..+$5.5k, positive in both
+    # halves but carried by a minority of big winners; paper ignores borrow limits/fees.
+    # Off unless EOD_SHORT_ENABLED=true. Independent of ENABLE_SHORTS (which keeps the
+    # old scan-driven shorts off). Ledger strategy "eodshort" so results can be measured.
+    #   EOD_SHORT_USD=1000  EOD_SHORT_TRAIL_PCT=4  EOD_SHORT_MAX_DAYS=3  EOD_SHORT_MAX_PER_DAY=8
+    async def _eod_short_after_sale(self, symbol: str, long_qty: float, plpc: float, ledger: Any) -> None:
+        import os as _os
+        from backend.execution import place_market_short
+        if str(_os.environ.get("EOD_SHORT_ENABLED", "")).strip().lower() not in ("1", "true", "yes", "on"):
+            return
+        usd = float(_os.environ.get("EOD_SHORT_USD", "1000") or 1000)
+        trail = float(_os.environ.get("EOD_SHORT_TRAIL_PCT", "4") or 4)
+        max_days = int(float(_os.environ.get("EOD_SHORT_MAX_DAYS", "3") or 3))
+        max_day = int(float(_os.environ.get("EOD_SHORT_MAX_PER_DAY", "8") or 8))
+        now = datetime.now(ET)
+        if now.hour * 60 + now.minute > 15 * 60 + 58:
+            return
+        st = self.__dict__.setdefault("_eod_short_state", {"date": None, "count": 0})
+        if st["date"] != now.date():
+            st["date"] = now.date()
+            st["count"] = 0
+        if st["count"] >= max_day:
+            return
+        if symbol.upper() in _entry_blocklist():
+            return
+        # 1) wait until the long is really gone (an Alpaca account cannot flip long->short in one order)
+        gone = False
+        for _ in range(10):
+            await asyncio.sleep(1.5)
+            pos = await _get_open_positions()
+            mine = next((p for p in pos if p.get("symbol") == symbol), None)
+            if mine is None:
+                gone = True
+                break
+        if not gone:
+            logger.info("eod_short skipped %s — long position still open after the sale", symbol)
+            return
+        price = await get_latest_price(symbol)
+        if not price or price < 10.0:
+            logger.info("eod_short skipped %s — price %s below the $10 short minimum", symbol, price)
+            return
+        notional = min(usd, float(price) * float(long_qty))
+        sqty = int(notional // float(price))
+        if sqty < 1:
+            return
+        _PENDING_BUYS.add(symbol)
+        try:
+            order_id, fill_price = await place_market_short(symbol, sqty, override=True)
+        finally:
+            _PENDING_BUYS.discard(symbol)
+        if not order_id:
+            logger.warning("eod_short %s — short order not placed (not shortable / risk check / rejected)", symbol)
+            return
+        st["count"] += 1
+        # 2) confirm the short exists, then attach the trailing buy-stop
+        short_qty = 0.0
+        entry_px = fill_price
+        for _ in range(12):
+            await asyncio.sleep(1.5)
+            pos = await _get_open_positions()
+            mine = next((p for p in pos if p.get("symbol") == symbol), None)
+            if mine is not None and float(mine.get("qty", 0) or 0) < 0:
+                short_qty = abs(float(mine.get("qty", 0)))
+                try:
+                    entry_px = float(mine.get("avg_entry_price") or 0) or fill_price
+                except Exception:
+                    pass
+                break
+        if short_qty <= 0:
+            logger.warning("eod_short %s — order %s not filled within 18s; protect pass will cover any late fill", symbol, order_id)
+            return
+        stop_id = await place_trailing_stop_buy(symbol, short_qty, trail)
+        if not stop_id:
+            logger.error("eod_short %s — trailing buy-stop NOT placed (protect pass will retry)", symbol)
+        add_entry(
+            ledger,
+            symbol=symbol,
+            side="short",
+            qty=short_qty,
+            entry_price=entry_px or price,
+            order_id=order_id,
+            strategy="eodshort",
+            cooldown_minutes=self.cooldown_minutes,
+            metadata={
+                "short": True,
+                "eod_short": True,
+                "trailing_stop_pct": trail,
+                "max_hold_days": max_days,
+                "source_gain_pct": round(plpc * 100.0, 3),
+                "signal_direction": "sell",
+            },
+        )
+        _BOUGHT_THIS_SESSION.add(symbol)
+        logger.warning(
+            "eod_short opened symbol=%s qty=%s entry=%s trail=%.1f%% (flipped after selling a +%.2f%% winner)",
+            symbol, short_qty, entry_px, trail, plpc * 100.0,
+        )
+
+    async def _eod_short_cover_pass(self) -> None:
+        import os as _os
+        from backend.execution import place_market_cover
+        if str(_os.environ.get("EOD_SHORT_ENABLED", "")).strip().lower() not in ("1", "true", "yes", "on"):
+            return
+        try:
+            _start = int(float(_os.environ.get("EOD_SHORT_COVER_START_MIN", "955") or 955))
+            _end = int(float(_os.environ.get("EOD_SHORT_COVER_END_MIN", "958") or 958))
+            _max_tries = int(float(_os.environ.get("EOD_SHORT_MAX_TRIES", "3") or 3))
+        except Exception:
+            return
+        now = datetime.now(ET)
+        mins = now.hour * 60 + now.minute
+        if mins < _start or mins > _end or now.weekday() >= 5 or not _is_regular_market_hours():
+            return
+        st = self.__dict__.setdefault("_eod_short_cover_state", {"date": None, "tries": {}})
+        if st["date"] != now.date():
+            st["date"] = now.date()
+            st["tries"] = {}
+        lock = self.__dict__.setdefault("_exit_pass_lock", asyncio.Lock())
+        if lock.locked():
+            return
+        async with lock:
+            try:
+                positions = await _get_open_positions()
+                ledger = load_ledger()
+                for p in positions:
+                    symbol = p.get("symbol")
+                    try:
+                        qty = float(p.get("qty", 0) or 0)
+                    except Exception:
+                        continue
+                    if not symbol or qty >= 0 or symbol in _PENDING_SELLS or symbol in _PENDING_BUYS:
+                        continue
+                    if st["tries"].get(symbol, 0) >= _max_tries:
+                        continue
+                    entries = ledger.get(symbol, [])
+                    e = next((x for x in reversed(entries) if isinstance(x, dict) and x.get("status") == "open" and x.get("strategy") == "eodshort"), None) if isinstance(entries, list) else None
+                    if not e:
+                        continue
+                    dt = _from_iso(e.get("created_at"))
+                    if dt is None:
+                        continue
+                    try:
+                        limit_days = int((e.get("metadata") or {}).get("max_hold_days") or 3)
+                    except Exception:
+                        limit_days = 3
+                    if self._count_trading_days(dt.astimezone(ET), now) < limit_days:
+                        continue
+                    st["tries"][symbol] = st["tries"].get(symbol, 0) + 1
+                    logger.warning("eod_short_cover symbol=%s qty=%s — time limit (%d trading days) reached", symbol, qty, limit_days)
+                    _PENDING_SELLS.add(symbol)
+                    try:
+                        order_id = await place_market_cover(symbol, abs(qty))
+                        if order_id:
+                            close_entry(ledger, symbol=symbol, order_id=order_id, exit_price=None, reason="eodshort_time", cooldown_minutes=self.cooldown_minutes)
+                            save_ledger(ledger)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("eod_short_cover failed symbol=%s", symbol)
+                    finally:
+                        _PENDING_SELLS.discard(symbol)
+                    await asyncio.sleep(0.4)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("_eod_short_cover_pass failed")
+    # EOD-SHORT END
 
     async def _intraday_time_exit_pass_inner(self, ledger: Any) -> None:
         if not _is_regular_market_hours():
