@@ -1194,7 +1194,7 @@ class botV3:
 
     async def _close_position_market(self, symbol: str, qty: float, reason: str, ledger: Any) -> None:
         try:
-            if reason in ("intraday_time_exit", "stagnant_exit", "runner_volume_fade", "eod_sell_winner"):
+            if reason in ("intraday_time_exit", "stagnant_exit", "runner_volume_fade", "eod_sell_winner", "eod_red_open"):
                 existing_orders = await _get_open_orders_for_symbol(symbol)
                 for o in existing_orders:
                     if str(o.get("side", "")).lower() == "sell":
@@ -1686,6 +1686,7 @@ class botV3:
                 _seq0 = _CLOSE_SEQ[0]
                 await self._intraday_time_exit_pass(load_ledger())
                 await self._eod_sell_winners_pass()
+                await self._eod_red_open_pass()
                 if _CLOSE_SEQ[0] != _seq0:
                     # Persist the closes on a fresh read of the ledger (no awaits
                     # between the read and the write, so nothing can interleave).
@@ -1791,6 +1792,106 @@ class botV3:
             except Exception:
                 logger.exception("_eod_sell_winners_pass failed")
     # EOD-SELL-WINNERS END
+
+    # EOD-RED-OPEN BEGIN -- a position bought on the PREVIOUS trading day that was not
+    # sold at 15:50 (i.e. it was flat/red) is exited right after the next open instead
+    # of being carried into the day. History (paper, 10 weeks): these names drift +0.1%
+    # to the open and then lose ~0.4% more over the following days; selling at ~9:32
+    # beat what the bot actually did by ~$4.6k, positive in both halves. Off unless
+    # EOD_RED_OPEN_SELL=true. Window 9:31-9:40 ET (EOD_RED_START_MIN / EOD_RED_END_MIN,
+    # minutes after midnight). Only positions whose open ledger entries were ALL created
+    # on the previous trading day between 9:30 and 15:40 ET; smarttiq/nexus excluded;
+    # older carries are left to the normal exits.
+    async def _eod_red_open_pass(self) -> None:
+        import os as _os
+        if str(_os.environ.get("EOD_RED_OPEN_SELL", "")).strip().lower() not in ("1", "true", "yes", "on"):
+            return
+        try:
+            _start = int(float(_os.environ.get("EOD_RED_START_MIN", "571") or 571))
+            _end = int(float(_os.environ.get("EOD_RED_END_MIN", "580") or 580))
+            _max_tries = int(float(_os.environ.get("EOD_RED_MAX_TRIES", "3") or 3))
+            _per_tick = int(float(_os.environ.get("EOD_RED_MAX_PER_TICK", "12") or 12))
+        except Exception:
+            return
+        now = datetime.now(ET)
+        mins = now.hour * 60 + now.minute
+        if mins < _start or mins > _end or now.weekday() >= 5:
+            return
+        if not _is_regular_market_hours():
+            return
+        st = self.__dict__.setdefault("_eod_red_state", {"date": None, "tries": {}})
+        if st["date"] != now.date():
+            st["date"] = now.date()
+            st["tries"] = {}
+        lock = self.__dict__.setdefault("_exit_pass_lock", asyncio.Lock())
+        if lock.locked():
+            return
+        async with lock:
+            try:
+                positions = await _get_open_positions()
+                if not positions:
+                    return
+                ledger = load_ledger()
+                cands: list[tuple[float, str, float]] = []
+                for p in positions:
+                    symbol = p.get("symbol")
+                    try:
+                        qty = float(p.get("qty", 0) or 0)
+                        plpc = float(p.get("unrealized_plpc", 0) or 0)
+                    except Exception:
+                        continue
+                    if not symbol or qty <= 0:
+                        continue
+                    if symbol in _PENDING_SELLS or symbol in _PENDING_BUYS:
+                        continue
+                    if st["tries"].get(symbol, 0) >= _max_tries:
+                        continue
+                    entries = ledger.get(symbol, [])
+                    opens = [e for e in entries if isinstance(e, dict) and e.get("status") == "open"] if isinstance(entries, list) else []
+                    if not opens:
+                        continue
+                    if any(_entry_kind(e) in _LONG_HOLD_KINDS for e in opens):
+                        continue
+                    ok = True
+                    for e in opens:
+                        dt = _from_iso(e.get("created_at"))
+                        if dt is None:
+                            ok = False
+                            break
+                        dte = dt.astimezone(ET)
+                        age = self._count_trading_days(dte, now)
+                        em = dte.hour * 60 + dte.minute
+                        if age != 1 or em < 9 * 60 + 30 or em > 15 * 60 + 40:
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+                    cands.append((plpc, symbol, qty))
+                if not cands:
+                    return
+                cands.sort()  # worst first
+                for plpc, symbol, qty in cands[:_per_tick]:
+                    st["tries"][symbol] = st["tries"].get(symbol, 0) + 1
+                    logger.warning(
+                        "eod_red_open symbol=%s pnl=%.2f%% qty=%s try=%d — exiting yesterday's carry right after the open",
+                        symbol, plpc * 100.0, qty, st["tries"][symbol],
+                    )
+                    _PENDING_SELLS.add(symbol)
+                    try:
+                        await self._close_position_market(symbol, qty, "eod_red_open", ledger)
+                        save_ledger(ledger)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("eod_red_open failed symbol=%s", symbol)
+                    finally:
+                        _PENDING_SELLS.discard(symbol)
+                    await asyncio.sleep(0.4)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("_eod_red_open_pass failed")
+    # EOD-RED-OPEN END
 
     async def _intraday_time_exit_pass_inner(self, ledger: Any) -> None:
         if not _is_regular_market_hours():
