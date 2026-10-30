@@ -234,6 +234,23 @@ async def _held_exit_qty(symbol: str) -> float:
     return held + standalone_held
 
 
+# QTY-CLAMP BEGIN -- exit passes snapshot position qty once per tick and then sell
+# name by name (stop-cancel waits + pauses), so another exit can shrink a position in
+# between and Alpaca 403s "requested 60, available 30". Re-read the live qty right
+# before the order and never ask for more than is actually held.
+async def _live_long_qty(symbol: str) -> Optional[float]:
+    try:
+        resp = await _request("GET", f"{ALPACA_BASE_URL}/v2/positions/{symbol}")
+        if resp.status_code == 200:
+            return float((resp.json() or {}).get("qty") or 0)
+        if resp.status_code == 404:
+            return 0.0
+    except Exception:
+        logger.exception("live qty lookup failed for %s", symbol)
+    return None
+# QTY-CLAMP END
+
+
 async def _available_exit_qty(symbol: str, requested_qty: float) -> float:
     if requested_qty <= 0:
         return 0.0
@@ -791,6 +808,12 @@ async def place_market_sell(symbol: str, qty: float) -> Optional[str]:
         if available_qty <= 0:
             logger.warning("Skipping market sell for %s: no available qty after cancel", symbol)
             return None
+
+        # QTY-CLAMP: never request more than the live long position holds
+        _live = await _live_long_qty(symbol)
+        if _live is not None and 0 < _live < available_qty:
+            logger.warning("sell_qty_clamped symbol=%s requested=%s live=%s", symbol, available_qty, _live)
+            available_qty = _live
 
         payload = {
             "symbol": symbol,
