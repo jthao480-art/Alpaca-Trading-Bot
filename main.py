@@ -273,6 +273,8 @@ async def main() -> None:
     asyncio.create_task(monitor_pm_signal_buy())
     from backend.held_extended_exit import monitor_held_extended_exit
     asyncio.create_task(monitor_held_extended_exit())
+    from backend.ah_shadow import monitor_ah_shadow
+    asyncio.create_task(monitor_ah_shadow())
     from backend.premarket_tp import monitor_premarket_tp
     asyncio.create_task(monitor_premarket_tp())
 
