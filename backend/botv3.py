@@ -2652,6 +2652,16 @@ class botV3:
                             symbol, _rng * 100, _min_range * 100,
                         )
                         continue
+            # CHASE-FILTER: skip buys on stocks that already made their move (ENTRY_CHASE_FILTER=shadow|on)
+            if str(signal.get("agent", "")).lower() not in ("tradetiq", "smarttiq", "nexus"):
+                try:
+                    from backend.chase_filter import should_skip as _chase_skip
+                    if await _chase_skip(symbol, float(price), qty, str(signal.get("agent", "")), score):
+                        continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("chase_filter failed for %s (buy allowed)", symbol)
             if _open_position_count >= _max_positions:
                 if _rotations_this_cycle >= _max_rotations_per_cycle:
                     logger.info(

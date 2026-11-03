@@ -275,6 +275,8 @@ async def main() -> None:
     asyncio.create_task(monitor_held_extended_exit())
     from backend.ah_shadow import monitor_ah_shadow
     asyncio.create_task(monitor_ah_shadow())
+    from backend.chase_filter import monitor_chase_outcomes
+    asyncio.create_task(monitor_chase_outcomes())
     from backend.premarket_tp import monitor_premarket_tp
     asyncio.create_task(monitor_premarket_tp())
 
