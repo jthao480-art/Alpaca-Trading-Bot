@@ -1194,7 +1194,7 @@ class botV3:
 
     async def _close_position_market(self, symbol: str, qty: float, reason: str, ledger: Any) -> None:
         try:
-            if reason in ("intraday_time_exit", "stagnant_exit", "runner_volume_fade", "eod_sell_winner", "eod_red_open"):
+            if reason in ("intraday_time_exit", "stagnant_exit", "runner_volume_fade", "eod_sell_winner", "eod_flatten", "eod_red_open"):
                 existing_orders = await _get_open_orders_for_symbol(symbol)
                 for o in existing_orders:
                     if str(o.get("side", "")).lower() == "sell":
@@ -1714,6 +1714,11 @@ class botV3:
             _start = int(float(_os.environ.get("EOD_SELL_START_MIN", "950") or 950))
             _end = int(float(_os.environ.get("EOD_SELL_END_MIN", "957") or 957))
             _thr = float(_os.environ.get("EOD_SELL_MIN_GAIN_PCT", "0.3") or 0.3) / 100.0
+            _short_thr = _thr  # only names sold at/above this feed the EOD-short experiment
+            # EOD_SELL_ALL=true: flatten EVERY name bought today (losers too) instead of
+            # carrying red ones overnight. Backtest: carrying losers overnight is the biggest leak.
+            if str(_os.environ.get("EOD_SELL_ALL", "")).strip().lower() in ("1", "true", "yes", "on"):
+                _thr = -1.0
             _max_tries = int(float(_os.environ.get("EOD_SELL_MAX_TRIES", "3") or 3))
             _per_tick = int(float(_os.environ.get("EOD_SELL_MAX_PER_TICK", "12") or 12))
         except Exception:
@@ -1774,13 +1779,14 @@ class botV3:
                 _sold_now: list = []
                 for plpc, symbol, qty in cands[:_per_tick]:
                     st["tries"][symbol] = st["tries"].get(symbol, 0) + 1
+                    _reason = "eod_sell_winner" if plpc >= _short_thr else "eod_flatten"
                     logger.warning(
-                        "eod_sell_winner symbol=%s gain=%.2f%% qty=%s try=%d — selling before the close instead of carrying overnight",
-                        symbol, plpc * 100.0, qty, st["tries"][symbol],
+                        "%s symbol=%s gain=%.2f%% qty=%s try=%d — selling before the close instead of carrying overnight",
+                        _reason, symbol, plpc * 100.0, qty, st["tries"][symbol],
                     )
                     _PENDING_SELLS.add(symbol)
                     try:
-                        await self._close_position_market(symbol, qty, "eod_sell_winner", ledger)
+                        await self._close_position_market(symbol, qty, _reason, ledger)
                         _sold_now.append((symbol, qty, plpc))
                         save_ledger(ledger)
                     except asyncio.CancelledError:
@@ -1791,6 +1797,8 @@ class botV3:
                         _PENDING_SELLS.discard(symbol)
                     await asyncio.sleep(0.4)
                 for _sym, _q, _pl in _sold_now:
+                    if _pl < _short_thr:
+                        continue  # flattened losers never feed the short experiment
                     try:
                         await self._eod_short_after_sale(_sym, _q, _pl, ledger)
                     except asyncio.CancelledError:
