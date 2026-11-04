@@ -1721,6 +1721,7 @@ class botV3:
                 _thr = -1.0
             _max_tries = int(float(_os.environ.get("EOD_SELL_MAX_TRIES", "3") or 3))
             _per_tick = int(float(_os.environ.get("EOD_SELL_MAX_PER_TICK", "12") or 12))
+            _flat_news = str(_os.environ.get("EOD_FLATTEN_NEWSBUY", "")).strip().lower() in ("1", "true", "yes", "on")
         except Exception:
             return
         now = datetime.now(ET)
@@ -1763,6 +1764,10 @@ class botV3:
                     if not opens:
                         continue
                     if any(_entry_kind(e) in _LONG_HOLD_KINDS for e in opens):
+                        continue
+                    # news-buys keep their own exits (trailing stop, stale/volume fade, news watch):
+                    # they are never force-flattened red. A winner is still sold as before.
+                    if plpc < _short_thr and not _flat_news and any(str(e.get("strategy", "")).lower() == "newsbuy" for e in opens):
                         continue
                     fresh = True
                     for e in opens:
