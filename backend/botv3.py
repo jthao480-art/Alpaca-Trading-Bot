@@ -223,6 +223,55 @@ async def _volume_fade_reading(symbol: str, recent_minutes: int, now_et: datetim
         return None
     return recent_rate / earlier_rate, recent_rate, earlier_rate, earlier_minutes, earlier_vol
 
+_PULLBACK_FADE_STATE: dict[str, dict[str, float]] = {}
+
+
+async def _pullback_fade_reading(symbol: str, recent_minutes: int, now_et: datetime, entry_dt: datetime, entry_px: float):
+    """Pullback depth and volume pace for a held long, from 1-minute bars.
+    dd_pct = % below the highest high since entry (entry price counts as the
+    starting high); ratio = last `recent_minutes` of volume per minute vs the
+    session's earlier pace (same measure as _volume_fade_reading). Returns a
+    dict, or None when the data is missing or stale."""
+    bars = await get_bars(symbol, timeframe="1Min", limit=1000)
+    open_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    cutoff = now_et - timedelta(minutes=recent_minutes)
+    entry_min = entry_dt.astimezone(ET).replace(second=0, microsecond=0)
+    recent_vol = 0.0
+    earlier_vol = 0.0
+    high = float(entry_px) if entry_px and entry_px > 0 else 0.0
+    last = None
+    last_ts = None
+    for b in bars or []:
+        try:
+            ts = datetime.fromisoformat(str(b.get("t")).replace("Z", "+00:00")).astimezone(ET)
+            vol = float(b.get("v") or 0)
+            hi = float(b.get("h") or 0)
+            cl = float(b.get("c") or 0)
+        except Exception:
+            continue
+        if ts < open_et:
+            continue
+        if ts >= cutoff:
+            recent_vol += vol
+        else:
+            earlier_vol += vol
+        if ts > entry_min and hi > high:
+            high = hi
+        if cl > 0:
+            last, last_ts = cl, ts
+    earlier_minutes = (cutoff - open_et).total_seconds() / 60.0
+    if earlier_minutes <= 0 or recent_minutes <= 0 or last is None or high <= 0:
+        return None
+    if (now_et - last_ts).total_seconds() > 600:
+        return None  # stale bars (thin print) - do not act on them
+    earlier_rate = earlier_vol / earlier_minutes
+    if earlier_rate <= 0:
+        return None
+    ratio = (recent_vol / recent_minutes) / earlier_rate
+    return {"ratio": ratio, "dd_pct": 100.0 * (high - last) / high, "high": high, "last": last,
+            "earlier_minutes": earlier_minutes, "earlier_shares": earlier_vol}
+
+
 MAX_POSITIONS = int(getattr(config, "MAX_POSITIONS", 150))
 DAILY_LOSS_LIMIT = float(getattr(config, "DAILY_LOSS_LIMIT", -2000))
 MARKET_FILTER_THRESHOLD = float(getattr(config, "MARKET_FILTER_THRESHOLD", -0.005))
@@ -1194,7 +1243,7 @@ class botV3:
 
     async def _close_position_market(self, symbol: str, qty: float, reason: str, ledger: Any) -> None:
         try:
-            if reason in ("intraday_time_exit", "stagnant_exit", "runner_volume_fade", "eod_sell_winner", "eod_flatten", "eod_red_open"):
+            if reason in ("intraday_time_exit", "stagnant_exit", "runner_volume_fade", "eod_sell_winner", "eod_flatten", "eod_red_open", "pullback_volume_fade"):
                 existing_orders = await _get_open_orders_for_symbol(symbol)
                 for o in existing_orders:
                     if str(o.get("side", "")).lower() == "sell":
@@ -1640,6 +1689,155 @@ class botV3:
         for sym in list(_VOLUME_FADE_STATE):
             if sym not in held:
                 _VOLUME_FADE_STATE.pop(sym, None)
+
+    async def _pullback_fade_pass(self) -> None:
+        """
+        Pullback + fading-volume exit for long positions that are NOT runners.
+        Backtest (20 sessions, ~970 entries): after a 1.5-2% pullback from the
+        high since entry, stocks whose volume had faded (last 15 min of volume
+        below ~0.5x their earlier session pace) kept falling, while stocks that
+        still had normal/strong volume recovered. Cutting the fading ones
+        sooner than the flat trailing stop beat the flat stop in both halves of
+        the sample; widening the stop on strong volume added nothing, so it is
+        not done here. The resting trailing stop is left alone.
+        PULLBACK_FADE_MODE: off (default) | shadow (log only) | on (market sell).
+        Env: PULLBACK_FADE_DD_PCT=2.0, PULLBACK_FADE_RATIO=0.5,
+        PULLBACK_FADE_CONFIRM_CHECKS=2, PULLBACK_FADE_CHECK_SECONDS=120,
+        PULLBACK_FADE_MAX_PLPC_PCT=0.5 (only positions at/below this gain are
+        checked, to limit data calls), PULLBACK_FADE_NEWSBUY=false.
+        Never raises.
+        """
+        try:
+            import os as _os
+            mode = str(_os.environ.get("PULLBACK_FADE_MODE", "off")).strip().lower()
+            if mode not in ("shadow", "on"):
+                return
+            if not _is_regular_market_hours():
+                return
+            now_et = datetime.now(ET)
+            if now_et.hour * 60 + now_et.minute >= 15 * 60 + 50:
+                return  # the end-of-day sweep owns the close
+
+            def _ev(name: str, default: float) -> float:
+                try:
+                    return float(_os.environ.get(name, default))
+                except Exception:
+                    return float(default)
+
+            recent_min = int(_ev("PULLBACK_FADE_RECENT_MINUTES", 15))
+            min_earlier = _ev("PULLBACK_FADE_MIN_EARLIER_MINUTES", 30.0)
+            dd_thr = _ev("PULLBACK_FADE_DD_PCT", 2.0)
+            ratio_thr = _ev("PULLBACK_FADE_RATIO", 0.5)
+            confirm = max(1, int(_ev("PULLBACK_FADE_CONFIRM_CHECKS", 2)))
+            every = _ev("PULLBACK_FADE_CHECK_SECONDS", 120.0)
+            min_shares = _ev("PULLBACK_FADE_MIN_EARLIER_SHARES", 1000.0)
+            max_plpc = _ev("PULLBACK_FADE_MAX_PLPC_PCT", 0.5) / 100.0
+            incl_news = str(_os.environ.get("PULLBACK_FADE_NEWSBUY", "")).strip().lower() in ("1", "true", "yes", "on")
+            open_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            if (now_et - open_et).total_seconds() / 60.0 < recent_min + min_earlier:
+                return  # not enough of the session yet to measure a pace
+            positions = await _get_open_positions()
+            if not positions:
+                return
+            ledger = load_ledger()
+            held: set[str] = set()
+            for p in positions:
+                symbol = p.get("symbol")
+                try:
+                    qty = float(p.get("qty", 0) or 0)
+                    plpc = float(p.get("unrealized_plpc", 0) or 0)
+                except Exception:
+                    continue
+                if not symbol or qty <= 0:
+                    continue  # long side only
+                held.add(symbol)
+                if plpc > max_plpc:
+                    _PULLBACK_FADE_STATE.pop(symbol, None)
+                    continue
+                if symbol in _PENDING_SELLS or symbol in _PENDING_BUYS:
+                    continue
+                entries = ledger.get(symbol, [])
+                open_entry = (
+                    next((e for e in reversed(entries) if e.get("status") == "open"), None)
+                    if isinstance(entries, list) else None
+                )
+                if open_entry is None or _entry_kind(open_entry) in _LONG_HOLD_KINDS:
+                    continue
+                if str(open_entry.get("strategy", "")).lower() == "newsbuy" and not incl_news:
+                    continue
+                st = _PULLBACK_FADE_STATE.setdefault(symbol, {"strikes": 0.0, "ts": 0.0})
+                now_ts = datetime.now().timestamp()
+                if now_ts - st["ts"] < every:
+                    continue
+                st["ts"] = now_ts
+                try:
+                    entry_px = float(open_entry.get("entry_price") or p.get("avg_entry_price") or 0)
+                    ct = str(open_entry.get("created_at") or "")
+                    entry_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+                    if entry_dt.tzinfo is None:
+                        entry_dt = entry_dt.replace(tzinfo=ZoneInfo("UTC"))
+                    reading = await _pullback_fade_reading(symbol, recent_min, now_et, entry_dt, entry_px)
+                except Exception:
+                    logger.exception("pullback_fade_reading failed for %s", symbol)
+                    continue
+                if reading is None:
+                    continue
+                if reading["earlier_minutes"] < min_earlier or reading["earlier_shares"] < min_shares:
+                    st["strikes"] = 0.0
+                    continue  # not enough volume history to trust the ratio
+                if reading["dd_pct"] >= dd_thr and reading["ratio"] < ratio_thr:
+                    st["strikes"] += 1
+                else:
+                    st["strikes"] = 0.0
+                logger.info(
+                    "pullback_fade_check[%s] symbol=%s dd=%.2f%% ratio=%.2f gain=%.2f%% strikes=%d/%d",
+                    mode, symbol, reading["dd_pct"], reading["ratio"], plpc * 100.0, int(st["strikes"]), confirm,
+                )
+                if st["strikes"] < confirm:
+                    continue
+                md = open_entry.setdefault("metadata", {})
+                if "pullback_fade_px" not in md:
+                    md["pullback_fade_px"] = round(reading["last"], 4)
+                    md["pullback_fade_ratio"] = round(reading["ratio"], 3)
+                    md["pullback_fade_dd_pct"] = round(reading["dd_pct"], 3)
+                    md["pullback_fade_at"] = now_et.isoformat()
+                    md["pullback_fade_mode"] = mode
+                    try:
+                        with open(_DATA_DIR / "pullback_fade.jsonl", "a", encoding="utf-8") as fh:
+                            fh.write(json.dumps({
+                                "day": now_et.date().isoformat(), "at": now_et.isoformat(), "sym": symbol, "mode": mode,
+                                "price": reading["last"], "high": reading["high"], "dd": round(reading["dd_pct"], 3),
+                                "ratio": round(reading["ratio"], 3), "entry": entry_px, "qty": qty, "gain_pct": round(plpc * 100.0, 3),
+                                "agent": str(open_entry.get("strategy", "")),
+                            }, separators=(",", ":")) + "\n")
+                    except Exception:
+                        logger.exception("pullback_fade log write failed")
+                    save_ledger(ledger)
+                if mode != "on":
+                    logger.warning(
+                        "pullback_fade[shadow] symbol=%s dd=%.2f%% ratio=%.2f gain=%.2f%% - WOULD SELL (shadow, no order)",
+                        symbol, reading["dd_pct"], reading["ratio"], plpc * 100.0,
+                    )
+                    st["strikes"] = float(confirm)  # stay armed; the metadata/log above are written once
+                    continue
+                logger.warning(
+                    "pullback_fade_exit symbol=%s dd=%.2f%% ratio=%.2f (threshold %.2f) gain=%.2f%% - selling",
+                    symbol, reading["dd_pct"], reading["ratio"], ratio_thr, plpc * 100.0,
+                )
+                _PENDING_SELLS.add(symbol)
+                try:
+                    await self._close_position_market(symbol, qty, "pullback_volume_fade", ledger)
+                    save_ledger(ledger)
+                finally:
+                    _PENDING_SELLS.discard(symbol)
+                st["strikes"] = 0.0  # keep the check timestamp so a just-sold name is not re-sent within the interval
+            for sym in list(_PULLBACK_FADE_STATE):
+                if sym not in held:
+                    _PULLBACK_FADE_STATE.pop(sym, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("_pullback_fade_pass failed")
 
     def _count_trading_days(self, start: datetime, end: datetime) -> int:
         count = 0
@@ -2965,6 +3163,7 @@ class botV3:
                 await self._protect_positions()
                 await self._ratchet_trailing_stops()
                 await self._volume_fade_exit_pass()
+                await self._pullback_fade_pass()
         _now_et = datetime.now(ET)
         _market_open = _now_et.replace(hour=9, minute=30, second=0, microsecond=0)
         _entry_cutoff = _now_et.replace(hour=16, minute=0, second=0, microsecond=0)
@@ -2981,6 +3180,7 @@ class botV3:
         await self._protect_positions()
         await self._ratchet_trailing_stops()
         await self._volume_fade_exit_pass()
+        await self._pullback_fade_pass()
         return {
             "paper_only": paper_only,
             "signals": all_signals,
