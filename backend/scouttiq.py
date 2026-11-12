@@ -63,6 +63,11 @@ def mode() -> str:
     return m if m in ("off", "shadow", "on") else "off"
 
 
+def hold_sessions() -> int:
+    """Sessions a new position is held (default 5 = the scored rule). Open positions keep the exit date they were given."""
+    return max(1, min(20, _env_i("SCOUTTIQ_HOLD_SESSIONS", HOLD_SESSIONS)))
+
+
 def only_mode() -> bool:
     """SCOUTTIQ_ONLY=true: every other entry path (and new shorts) is refused at the order chokepoint."""
     return _env("SCOUTTIQ_ONLY", "false").lower() in ("1", "true", "yes", "on")
@@ -85,7 +90,7 @@ DECILE = 0.10
 SPLIT_GUARD = 0.45
 MIN_VALID_FRAC = 0.85
 MAX_BASE_AGE_DAYS = 4
-HOLD_SESSIONS = 5
+HOLD_SESSIONS = 5            # the scored rule; SCOUTTIQ_HOLD_SESSIONS overrides the hold for NEW entries only (repeat window stays 5)
 REPORT_LEAD_SESSIONS = 6
 C2_TOP_FRAC = 0.20
 MIN_PRICE = 5.0
@@ -820,7 +825,8 @@ async def _enter(sym: str, flag_price: float, version: str, info: dict, st: dict
         if qty < 1:
             rec["why_not"] = "qty_lt_1"
         else:
-            exit_date = session_offset(sessions, today, HOLD_SESSIONS)
+            hold_n = hold_sessions()
+            exit_date = session_offset(sessions, today, hold_n)
             # register BEFORE the order so every other exit loop already treats the symbol as held
             st["positions"][sym] = {"entry_date": today, "exit_date": exit_date, "qty": qty, "flag_price": flag_price,
                                     "version": version, "state": "pending", "ts": rec["ts"]}
@@ -846,7 +852,7 @@ async def _enter(sym: str, flag_price: float, version: str, info: dict, st: dict
                     add_entry(ledger, symbol=sym, side="long", qty=qty, entry_price=entry_px, order_id=order_id, strategy="scouttiq",
                               cooldown_minutes=0,
                               metadata={"source": "scouttiq", "version": version, "flag_price": flag_price,
-                                        "exit_date": exit_date, "hold_sessions": HOLD_SESSIONS, **info})
+                                        "exit_date": exit_date, "hold_sessions": hold_n, **info})
                     save_ledger(ledger)
                 except Exception:
                     logger.exception("scouttiq ledger entry failed for %s", sym)
@@ -1011,7 +1017,7 @@ async def monitor_scouttiq() -> None:
     if mode() == "off":
         logger.info("scouttiq: mode off (set SCOUTTIQ_MODE=shadow or on)")
         return
-    logger.info("scouttiq: started mode=%s only=%s", mode(), only_mode())
+    logger.info("scouttiq: started mode=%s only=%s hold_sessions=%d", mode(), only_mode(), hold_sessions())
     cycle_a = max(5, _env_i("SCOUTTIQ_CYCLE_MINUTES", 15)) * 60
     cycle_b = 5 * 60
     while True:
@@ -1060,7 +1066,7 @@ if __name__ == "__main__":
     elif cmd == "status":
         b = load_base()
         st = load_state()
-        print("mode=%s only=%s" % (mode(), only_mode()))
+        print("mode=%s only=%s hold_sessions=%d" % (mode(), only_mode(), hold_sessions()))
         print("base:", None if not b else {"formation": b["formation_date"], "rows": len(b["rows"]), **b.get("stats", {})})
         print("open scouttiq positions:", {k: (v.get("state"), v.get("entry_date"), v.get("exit_date")) for k, v in st["positions"].items()})
     elif cmd == "flags-now":

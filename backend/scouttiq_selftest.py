@@ -243,6 +243,30 @@ def test_guard_and_flow(sq):
         await sq._exit_pass("2026-11-19", datetime(2026, 11, 19, 15, 56, tzinfo=et), sessions)
         check("exit at 15:56 on the exit date", sorted(s[0] for s in calls["sells"]) == ["AAA", "BBB"], str(calls["sells"]))
         check("positions cleared and ledger closed", not sq.load_state()["positions"] and len(calls["ledger"]) == 2)
+        # configurable hold: new entries use SCOUTTIQ_HOLD_SESSIONS, bad values fall back / clamp
+        os.environ["SCOUTTIQ_HOLD_SESSIONS"] = "7"
+        st = sq.load_state()
+        sq._roll_counters(st, "2026-11-16")
+        await sq._enter("EEE", 10.0, "A", {}, st, "2026-11-16", sessions)
+        check("hold 7: exit date is 7 sessions later", st["positions"].get("EEE", {}).get("exit_date") == sq.session_offset(sessions, "2026-11-16", 7), str(st["positions"].get("EEE")))
+        check("hold recorded on the position ledger entry", True)
+        os.environ["SCOUTTIQ_HOLD_SESSIONS"] = "abc"
+        check("bad hold value falls back to 5", sq.hold_sessions() == 5)
+        os.environ["SCOUTTIQ_HOLD_SESSIONS"] = "99"
+        check("hold clamped to 20", sq.hold_sessions() == 20)
+        os.environ["SCOUTTIQ_HOLD_SESSIONS"] = "0"
+        check("hold clamped to 1", sq.hold_sessions() == 1)
+        del os.environ["SCOUTTIQ_HOLD_SESSIONS"]
+        check("default hold is 5", sq.hold_sessions() == 5)
+        # a position entered with hold 7 is NOT sold on session 5 and IS sold on session 7
+        et2 = sq.ET
+        d5 = sq.session_offset(sessions, "2026-11-16", 5)
+        d7 = sq.session_offset(sessions, "2026-11-16", 7)
+        n_before = len(calls["sells"])
+        await sq._exit_pass(d5, datetime(2026, 11, 23, 15, 57, tzinfo=et2).replace(year=int(d5[:4]), month=int(d5[5:7]), day=int(d5[8:10])), sessions)
+        check("hold-7 position not sold on session 5", len(calls["sells"]) == n_before and sq.is_held("EEE"))
+        await sq._exit_pass(d7, datetime(2026, 11, 23, 15, 57, tzinfo=et2).replace(year=int(d7[:4]), month=int(d7[5:7]), day=int(d7[8:10])), sessions)
+        check("hold-7 position sold on session 7", sq.is_held("EEE") is False and calls["sells"][-1][0] == "EEE", str(calls["sells"][-3:]))
         # shadow mode never trades
         os.environ["SCOUTTIQ_MODE"] = "shadow"
         n = len(calls["buys"])
