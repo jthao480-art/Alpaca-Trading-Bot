@@ -73,6 +73,12 @@ def only_mode() -> bool:
     return _env("SCOUTTIQ_ONLY", "false").lower() in ("1", "true", "yes", "on")
 
 
+def allow_shorts() -> bool:
+    """SCOUTTIQ_ALLOW_SHORTS=true: SCOUTTIQ_ONLY no longer refuses new shorts (e.g. the paper EOD flip-to-short experiment).
+    Longs from other agents stay refused, and a scoutTiq-held name still can never be sold or shorted."""
+    return _env("SCOUTTIQ_ALLOW_SHORTS", "false").lower() in ("1", "true", "yes", "on")
+
+
 def data_dir() -> Path:
     try:
         from backend import config
@@ -394,7 +400,7 @@ async def order_verdict(payload: dict, short_open: bool, long_qty_lookup) -> Opt
         if is_held(symbol):
             _guard_log("hold:" + symbol, "scouttiq_hold: refusing sell of %s (held until its 5-session exit)" % symbol)
             return "scouttiq_hold"
-        if only_mode() and short_open:
+        if only_mode() and short_open and not allow_shorts():
             _guard_log("short:" + symbol, "scouttiq_only: refusing new short %s" % symbol)
             return "scouttiq_only_short"
         return None
@@ -1066,7 +1072,7 @@ if __name__ == "__main__":
     elif cmd == "status":
         b = load_base()
         st = load_state()
-        print("mode=%s only=%s hold_sessions=%d" % (mode(), only_mode(), hold_sessions()))
+        print("mode=%s only=%s hold_sessions=%d allow_shorts=%s" % (mode(), only_mode(), hold_sessions(), allow_shorts()))
         print("base:", None if not b else {"formation": b["formation_date"], "rows": len(b["rows"]), **b.get("stats", {})})
         print("open scouttiq positions:", {k: (v.get("state"), v.get("entry_date"), v.get("exit_date")) for k, v in st["positions"].items()})
     elif cmd == "flags-now":

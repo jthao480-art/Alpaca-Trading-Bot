@@ -229,6 +229,16 @@ def test_guard_and_flow(sq):
         check("ONLY: cover of an old short allowed", v is None)
         v = await sq.order_verdict({"symbol": "NEWSHORT", "side": "sell"}, True, lq)
         check("ONLY: new short refused", v == "scouttiq_only_short", str(v))
+        os.environ["SCOUTTIQ_ALLOW_SHORTS"] = "true"
+        v = await sq.order_verdict({"symbol": "NEWSHORT", "side": "sell"}, True, lq)
+        check("ONLY + ALLOW_SHORTS: new short allowed", v is None, str(v))
+        v = await sq.order_verdict({"symbol": "ZZZ", "side": "buy"}, False, lq)
+        check("ONLY + ALLOW_SHORTS: other long buy still refused", v == "scouttiq_only_buy", str(v))
+        v = await sq.order_verdict({"symbol": "AAA", "side": "sell"}, True, lq)
+        check("ONLY + ALLOW_SHORTS: held scoutTiq name still cannot be sold/shorted", v == "scouttiq_hold", str(v))
+        del os.environ["SCOUTTIQ_ALLOW_SHORTS"]
+        v = await sq.order_verdict({"symbol": "NEWSHORT", "side": "sell"}, True, lq)
+        check("ALLOW_SHORTS off again: new short refused", v == "scouttiq_only_short", str(v))
         tok = sq.SCOUTTIQ_CTX.set(True)
         v = await sq.order_verdict({"symbol": "AAA", "side": "sell"}, False, lq)
         sq.SCOUTTIQ_CTX.reset(tok)
