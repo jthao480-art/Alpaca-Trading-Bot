@@ -31,7 +31,7 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from backend.execution import _get_open_positions
+from backend.execution import _get_open_positions_unheld as _get_open_positions  # SCOUTTIQ
 from backend.news_watch import _extended_exit, _regular_exit
 from backend.services.trade_ledger_service import close_entry, load_ledger, save_ledger, _from_iso
 

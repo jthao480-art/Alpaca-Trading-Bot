@@ -63,7 +63,7 @@ def save_ledger(ledger: dict[str, list[dict[str, Any]]]) -> None:
                     for e in entries:
                         if (
                             isinstance(e, dict)
-                            and (e.get("metadata") or {}).get("source") == "newsbuy"
+                            and (e.get("metadata") or {}).get("source") in ("newsbuy", "scouttiq")
                             and e.get("order_id") not in have
                         ):
                             mine.append(e)

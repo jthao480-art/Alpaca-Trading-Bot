@@ -51,7 +51,7 @@ from backend.execution import (
     _cancel_all_open_sell_orders,
     _cancel_order_by_id,
     _get_open_orders_for_symbol,
-    _get_open_positions,
+    _get_open_positions_unheld as _get_open_positions,  # SCOUTTIQ
     _post_order,
     _request,
     open_stops,

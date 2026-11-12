@@ -51,7 +51,7 @@ from backend import config
 from backend.execution import (
     _cancel_all_open_orders_for_side,
     _cancel_all_open_sell_orders,
-    _get_open_positions,
+    _get_open_positions_unheld as _get_open_positions,  # SCOUTTIQ
     _is_regular_market_hours,
     _open_orders_on_side,
     _post_order,

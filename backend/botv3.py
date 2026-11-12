@@ -29,7 +29,7 @@ from backend.execution import (
     place_trailing_stop_sell,
     place_trailing_stop_buy,
     _get_open_orders_for_symbol,
-    _get_open_positions,
+    _get_open_positions_unheld as _get_open_positions,  # SCOUTTIQ: held names are invisible to every botv3 exit/stop pass
     _cancel_order_by_id,
     _is_regular_market_hours,
     cancel_stray_bracket_legs,
@@ -846,7 +846,8 @@ class botV3:
         if self.trading_client is None:
             return []
         try:
-            return list(self.trading_client.get_all_positions())
+            from backend import scouttiq as _sq3
+            return [p for p in self.trading_client.get_all_positions() if not _sq3.is_held(str(getattr(p, "symbol", "")).upper())]
         except Exception:
             logger.exception("failed to fetch position objects")
             return []
@@ -1243,6 +1244,12 @@ class botV3:
 
     async def _close_position_market(self, symbol: str, qty: float, reason: str, ledger: Any) -> None:
         try:
+            from backend import scouttiq as _sq  # SCOUTTIQ: held 5 sessions; only the daily-loss halt may override
+            if reason != "daily_loss_halt" and _sq.is_held(symbol):
+                return
+        except Exception:
+            pass
+        try:
             if reason in ("intraday_time_exit", "stagnant_exit", "runner_volume_fade", "eod_sell_winner", "eod_flatten", "eod_red_open", "pullback_volume_fade"):
                 existing_orders = await _get_open_orders_for_symbol(symbol)
                 for o in existing_orders:
@@ -1250,7 +1257,15 @@ class botV3:
                         await _cancel_order_by_id(str(o.get("id", "")))
                         logger.info("Time exit: cancelled existing sell order for %s", symbol)
                 await asyncio.sleep(1.0)
-            order_id = await place_market_sell(symbol, qty)
+            _sq_tok = None
+            if reason == "daily_loss_halt":
+                from backend import scouttiq as _sq2
+                _sq_tok = _sq2.SCOUTTIQ_CTX.set(True)
+            try:
+                order_id = await place_market_sell(symbol, qty)
+            finally:
+                if _sq_tok is not None:
+                    _sq2.SCOUTTIQ_CTX.reset(_sq_tok)
             if order_id:
                 close_entry(ledger, symbol=symbol, order_id=order_id, exit_price=None, reason=reason, cooldown_minutes=self.cooldown_minutes)
                 _BOUGHT_THIS_SESSION.add(symbol)
@@ -3145,7 +3160,8 @@ class botV3:
             reset_daily_counts()
         all_signals: list[dict[str, Any]] = []
         errors = 0
-        symbols = await self._prefilter_symbols(list(self.symbols))
+        from backend import scouttiq as _sq  # SCOUTTIQ: with SCOUTTIQ_ONLY the other agents do not scan at all
+        symbols = [] if _sq.only_mode() else await self._prefilter_symbols(list(self.symbols))
         import random
         random.shuffle(symbols)
         symbols = symbols[:2000]

@@ -222,7 +222,7 @@ async def _run_startup_protection_sweep() -> None:
     from backend.execution import monitor_position_protection
     # Trigger one immediate sweep by calling the core logic directly
     from backend.execution import (
-        _get_open_positions, _get_open_orders_for_symbol,
+        _get_open_positions_unheld as _get_open_positions, _get_open_orders_for_symbol,
         place_trailing_stop_sell, TRAIL_PCT
     )
     try:
@@ -265,12 +265,16 @@ async def main() -> None:
     asyncio.create_task(monitor_position_protection(interval_seconds=7200))
     from backend.news_watch import monitor_held_news
     asyncio.create_task(monitor_held_news())
-    from backend.news_buy import monitor_news_buys
-    asyncio.create_task(monitor_news_buys())
+    from backend import scouttiq as _sq
+    if not _sq.only_mode():  # SCOUTTIQ_ONLY: other entry agents are not started
+        from backend.news_buy import monitor_news_buys
+        asyncio.create_task(monitor_news_buys())
     from backend.pm_quick_exit import monitor_pm_quick_exit
     asyncio.create_task(monitor_pm_quick_exit())
-    from backend.pm_signal_buy import monitor_pm_signal_buy
-    asyncio.create_task(monitor_pm_signal_buy())
+    if not _sq.only_mode():
+        from backend.pm_signal_buy import monitor_pm_signal_buy
+        asyncio.create_task(monitor_pm_signal_buy())
+    asyncio.create_task(_sq.monitor_scouttiq())  # does nothing unless SCOUTTIQ_MODE is shadow/on
     from backend.held_extended_exit import monitor_held_extended_exit
     asyncio.create_task(monitor_held_extended_exit())
     from backend.ah_shadow import monitor_ah_shadow

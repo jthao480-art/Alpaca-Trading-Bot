@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from backend import config
-from backend.execution import _get_open_positions
+from backend.execution import _get_open_positions_unheld as _get_open_positions  # SCOUTTIQ
 from backend import news_watch as _nw
 from backend.news_watch import _extended_exit, _regular_exit, _paced_get, _restore_protection
 from backend.services.trade_ledger_service import close_entry, load_ledger, save_ledger, _from_iso

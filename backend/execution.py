@@ -151,6 +151,17 @@ async def _get_open_positions() -> list[dict]:
         return []
 
 
+async def _get_open_positions_unheld() -> list[dict]:
+    """Open positions minus held scoutTiq names. For exit/stop loops that must leave those alone;
+    risk checks and position caps keep using _get_open_positions (held names still use capital)."""
+    out = await _get_open_positions()
+    try:
+        from backend import scouttiq as _sq
+        return [p for p in out if not _sq.is_held(str(p.get("symbol", "")).upper())]
+    except Exception:
+        return out
+
+
 async def _get_open_orders_for_symbol(symbol: str) -> list[dict]:
     try:
         resp = await _request("GET", f"{ALPACA_BASE_URL}/v2/orders", params={"status": "open", "symbols": symbol})
@@ -412,6 +423,13 @@ async def _post_order(payload: dict) -> Optional[dict]:
         payload = payload.model_dump(exclude_none=True)
     elif hasattr(payload, "dict"):
         payload = payload.dict(exclude_none=True)
+    # SCOUTTIQ-GUARD: held scoutTiq names are never sold by other loops; SCOUTTIQ_ONLY refuses other entries
+    try:
+        from backend import scouttiq as _sq
+        if await _sq.order_verdict(payload, _SHORT_OPEN_CTX.get(), _long_position_qty):
+            return None
+    except Exception:
+        logger.exception("scouttiq guard failed (order allowed)")
     try:
         if await _blocked_stray_sell(payload):
             return None
@@ -1471,7 +1489,7 @@ async def monitor_position_protection(interval_seconds: int = 7200) -> None:
         if not _is_regular_market_hours():
             continue
         try:
-            positions = await _get_open_positions()
+            positions = await _get_open_positions_unheld()
             if not positions:
                 continue
 
@@ -1614,7 +1632,7 @@ async def monitor_hard_stops(poll_interval: int = HARD_STOP_POLL_INTERVAL):
                 # top of that, not a substitute for it after-hours.)
                 await asyncio.sleep(poll_interval)
                 continue
-            positions = await _get_open_positions()
+            positions = await _get_open_positions_unheld()
             try:
                 await _cover_stray_shorts(positions)
             except Exception:
