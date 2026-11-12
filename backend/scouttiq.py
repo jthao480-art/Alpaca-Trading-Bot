@@ -637,6 +637,12 @@ def build_base(force: bool = False, sec_budget_calls: Optional[int] = None) -> d
     end_ts = (datetime.now(timezone.utc) - timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
     start = (today_et - timedelta(days=50)).isoformat()
     bars = fetch_daily_bars_sync(sorted(set(syms) | {"SPY"}), start, end_ts, feed)
+    _n_et = datetime.now(ET)
+    if _n_et.date().isoformat() in cal and (_n_et.hour, _n_et.minute) < (16, 20):
+        # today's daily bar is still forming (or not yet final): the base must come from completed sessions only
+        for _s in list(bars):
+            bars[_s] = [b for b in bars[_s] if b[0] < _n_et.date().isoformat()]
+        logger.info("scouttiq build: before 16:20 ET, ignoring today's unfinished bar")
     if "SPY" not in bars or not bars["SPY"]:
         raise RuntimeError("no SPY bars: cannot fix the formation date")
     formation = bars["SPY"][-1][0]
