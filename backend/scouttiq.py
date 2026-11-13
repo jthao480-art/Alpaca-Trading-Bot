@@ -353,12 +353,68 @@ def save_state(st: dict) -> None:
         _STATE_CACHE["data"] = None
 
 
-def is_held(symbol: str) -> bool:
-    """True if `symbol` is an open (or being-opened) scoutTiq position."""
+def _today_et() -> str:
+    return datetime.now(ET).date().isoformat()
+
+
+_TAKEN_CACHE: dict[str, Any] = {"key": None, "data": {}}
+
+
+def _recent_taken() -> dict[str, str]:
+    """symbol -> exit_date for entries in the flags log with no later exit/released event.
+
+    A second, independent record of what scoutTiq holds, so a lost or mis-read state file cannot silently unprotect a position."""
+    p = FLAGS_PATH()
     try:
-        return str(symbol).upper() in load_state().get("positions", {})
+        stt = p.stat()
+        key = (str(p), stt.st_mtime_ns, stt.st_size)
     except Exception:
-        return False
+        return {}
+    if _TAKEN_CACHE["key"] == key:
+        return _TAKEN_CACHE["data"]
+    out: dict[str, str] = {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                sym = str(r.get("symbol", "")).upper()
+                if not sym:
+                    continue
+                if r.get("event") in ("exit", "released"):
+                    out.pop(sym, None)
+                elif r.get("taken") and r.get("exit_date"):
+                    out[sym] = str(r["exit_date"])
+    except Exception:
+        logger.exception("scouttiq flags log read failed")
+        return _TAKEN_CACHE["data"] or {}
+    _TAKEN_CACHE.update(key=key, data=out)
+    return out
+
+
+def is_held(symbol: str) -> bool:
+    """True if `symbol` is an open (or being-opened) scoutTiq position.
+
+    Checks the state file first, then the flags log as a fallback (entered, not yet exited, exit date not past)."""
+    sym = str(symbol).upper()
+    try:
+        if sym in load_state().get("positions", {}):
+            return True
+    except Exception:
+        logger.exception("scouttiq state read failed in is_held(%s)", sym)
+    try:
+        ex = _recent_taken().get(sym)
+        if ex and ex >= _today_et():
+            _guard_log("fallback:" + sym, "scouttiq_hold: %s is missing from the state file but the flags log shows it entered "
+                       "with exit %s - treating it as held" % (sym, ex))
+            return True
+    except Exception:
+        logger.exception("scouttiq flags fallback failed in is_held(%s)", sym)
+    return False
 
 
 def append_flag_log(rec: dict) -> None:
@@ -809,6 +865,19 @@ def _roll_counters(st: dict, today: str) -> None:
         st["entries_today"] = {"date": today, "n": 0}
 
 
+async def _broker_qty(sym: str) -> Optional[float]:
+    """Signed quantity the account holds in `sym` (0.0 = flat), or None if the broker lookup failed."""
+    try:
+        from backend.execution import _get_open_positions
+        for p in await _get_open_positions():
+            if str(p.get("symbol", "")).upper() == sym:
+                return float(p.get("qty") or 0)
+        return 0.0
+    except Exception:
+        logger.exception("scouttiq broker position lookup failed for %s", sym)
+        return None
+
+
 async def _enter(sym: str, flag_price: float, version: str, info: dict, st: dict, today: str, sessions: list[str]) -> None:
     """Place the buy for one new flag (mode 'on') and register the position."""
     from backend.execution import place_market_buy, get_latest_price
@@ -825,6 +894,11 @@ async def _enter(sym: str, flag_price: float, version: str, info: dict, st: dict
         rec["why_not"] = "max_positions"
     elif st["entries_today"]["n"] >= max_day:
         rec["why_not"] = "max_new_per_day"
+    elif (await _broker_qty(sym)) not in (None, 0.0):
+        # the account already holds this name (e.g. a legacy short): buying would just partly cover it and scoutTiq
+        # would then hide the rest from the legacy exits, so skip it
+        rec["why_not"] = "already_at_broker"
+        logger.warning("scouttiq: skipping %s - the account already holds a position in it", sym)
     else:
         px = await get_latest_price(sym) or flag_price
         qty = int(usd // px) if px else 0
@@ -944,11 +1018,26 @@ async def _exit_pass(today: str, now_et: datetime, sessions: list[str]) -> None:
                 if age > 900 and live is not None and sym not in live:
                     st["positions"].pop(sym, None)
                     changed = True
+                    append_flag_log({"ts": datetime.now(timezone.utc).isoformat(), "date": today, "symbol": sym, "event": "released",
+                                     "reason": "pending_never_filled"})
             continue
         if live is not None and sym not in live:
             logger.info("SCOUTTIQ position %s no longer at broker: dropping from state", sym)
             st["positions"].pop(sym, None)
             changed = True
+            append_flag_log({"ts": datetime.now(timezone.utc).isoformat(), "date": today, "symbol": sym, "event": "released",
+                             "reason": "gone_at_broker"})
+            continue
+        try:
+            live_q = float(live[sym].get("qty") or 0) if live is not None else None
+        except Exception:
+            live_q = None
+        if live_q is not None and live_q <= 0:
+            logger.warning("SCOUTTIQ position %s is short/flat at the broker (qty=%s): releasing it to the legacy exits", sym, live_q)
+            st["positions"].pop(sym, None)
+            changed = True
+            append_flag_log({"ts": datetime.now(timezone.utc).isoformat(), "date": today, "symbol": sym, "event": "released",
+                             "reason": "broker_qty_%s" % live_q})
             continue
         reason = None
         ex = pos.get("exit_date") or ""
