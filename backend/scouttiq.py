@@ -1161,6 +1161,188 @@ async def _exit_pass(today: str, now_et: datetime, sessions: list[str]) -> None:
         save_state(st)
 
 
+# ───────────────────────────── outcome scoring of every flag (taken or not) ─────────────────────────────
+OUTCOME_COST = 0.0030
+OUTCOME_HORIZONS = (5, 7)
+OUTCOMES_PATH = lambda: data_dir() / "scouttiq_outcomes.jsonl"
+
+
+def flag_category(r: dict) -> str:
+    if r.get("taken"):
+        return "taken"
+    w = str(r.get("why_not") or "")
+    if w.startswith("repeat"):
+        return "repeat"                      # the spec does not count a repeat flag within 5 sessions
+    if w in ("max_new_per_day", "max_positions"):
+        return "skipped_cap"
+    if w == "shadow":
+        return "shadow"
+    return "skipped_other"
+
+
+def read_flag_rows() -> list[dict]:
+    p = FLAGS_PATH()
+    if not p.exists():
+        return []
+    rows = []
+    with open(p, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("event") or not r.get("symbol") or not r.get("date"):
+                continue
+            rows.append(r)
+    return rows
+
+
+def score_rows(flag_rows: list[dict], bars: dict, sessions: list[str], universe: list[str], last_complete: str,
+               horizons=OUTCOME_HORIZONS, cost: float = OUTCOME_COST) -> tuple[list[dict], int]:
+    """Forward result of every logged flag. bars = {symbol: {date: close}} (raw closes).
+
+    net    = close at the exit session / flag price - 1 - cost           (what the bot would have made)
+    excess = (exit close / flag-day close - 1) - average of the liquid universe over the same two closes
+    Only horizons whose exit session is complete are scored. Observations beyond the split guard are dropped (returned count)."""
+    ucache: dict = {}
+
+    def umean(d0, d1):
+        k = (d0, d1)
+        if k not in ucache:
+            vals = []
+            for u in universe:
+                b = bars.get(u)
+                if not b:
+                    continue
+                a, z = b.get(d0), b.get(d1)
+                if a and z and a > 0:
+                    r = z / a - 1
+                    if abs(r) <= SPLIT_GUARD:
+                        vals.append(r)
+            ucache[k] = (sum(vals) / len(vals)) if len(vals) >= 20 else None
+        return ucache[k]
+
+    out, dropped = [], 0
+    for r in flag_rows:
+        sym = str(r["symbol"]).upper()
+        d = r["date"]
+        try:
+            px = float(r.get("flag_price"))
+        except Exception:
+            continue
+        if px <= 0:
+            continue
+        for h in horizons:
+            ex = session_offset(sessions, d, h)
+            if not ex or ex > last_complete:
+                continue
+            b = bars.get(sym) or {}
+            c1 = b.get(ex)
+            if not c1:
+                continue
+            gross = c1 / px - 1
+            if abs(gross) > SPLIT_GUARD:
+                dropped += 1
+                continue
+            excess = None
+            c0 = b.get(d)
+            if c0:
+                u = umean(d, ex)
+                if u is not None:
+                    excess = (c1 / c0 - 1) - u
+            out.append({"date": d, "symbol": sym, "version": r.get("version"), "category": flag_category(r), "horizon": h,
+                        "exit_date": ex, "flag_price": round(px, 4), "exit_close": round(c1, 4),
+                        "net": round(gross - cost, 5), "excess": None if excess is None else round(excess, 5)})
+    return out, dropped
+
+
+def summarize_outcomes(rows: list[dict]) -> list[dict]:
+    import statistics
+    groups: dict = {}
+    for r in rows:
+        for ver in (r["version"], "ALL"):
+            groups.setdefault((r["category"], ver, r["horizon"]), []).append(r)
+    out = []
+    for (cat, ver, h), rs in sorted(groups.items(), key=lambda kv: (kv[0][2], kv[0][0], str(kv[0][1]))):
+        nets = [x["net"] for x in rs]
+        ex = [x["excess"] for x in rs if x["excess"] is not None]
+        out.append({"category": cat, "version": ver, "horizon": h, "n": len(rs), "mean_net": sum(nets) / len(nets),
+                    "median_net": statistics.median(nets), "hit": sum(1 for v in nets if v > 0) / len(nets),
+                    "n_excess": len(ex), "mean_excess": (sum(ex) / len(ex)) if ex else None})
+    return out
+
+
+def format_outcomes(summary: list[dict], dropped: int = 0) -> str:
+    if not summary:
+        return "no completed outcomes yet (a flag needs its 5th session to finish first)"
+    lines = ["hold category      ver    n   mean_net  median   hit   excess_vs_universe(n)"]
+    for g in summary:
+        ex = "   n/a" if g["mean_excess"] is None else "%+6.2f%% (%d)" % (100 * g["mean_excess"], g["n_excess"])
+        lines.append("%2dd  %-13s %-4s %4d  %+7.2f%% %+7.2f%% %4.0f%%   %s" % (
+            g["horizon"], g["category"], g["version"], g["n"], 100 * g["mean_net"], 100 * g["median_net"], 100 * g["hit"], ex))
+    if dropped:
+        lines.append("(%d observations dropped by the %d%% split guard)" % (dropped, int(SPLIT_GUARD * 100)))
+    lines.append("net = exit close vs flag price, after 0.30% cost. excess = stock minus the liquid-universe average over the same closes.")
+    return "\n".join(lines)
+
+
+def compute_outcomes() -> tuple[list[dict], list[dict], int]:
+    flags = read_flag_rows()
+    if not flags:
+        return [], [], 0
+    now = datetime.now(ET)
+    today = now.date().isoformat()
+    start = (_d(min(r["date"] for r in flags)) - timedelta(days=6)).isoformat()
+    cal = fetch_calendar_sync(start, (now.date() + timedelta(days=60)).isoformat())
+    if not cal:
+        raise RuntimeError("no trading calendar")
+    if today in cal and (now.hour, now.minute) >= (16, 20):
+        last_complete = today
+    else:
+        last_complete = max([x for x in cal if x < today] or [start])
+    b = load_base()
+    universe = [r["t"] for r in b["rows"]] if b else []
+    syms = sorted({str(r["symbol"]).upper() for r in flags} | set(universe))
+    end_ts = (datetime.now(timezone.utc) - timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    raw = fetch_daily_bars_sync(syms, start, end_ts, _env("SCOUTTIQ_BARS_FEED", "sip"))
+    bars = {sym: {d: c for d, c, _v in lst} for sym, lst in raw.items()}
+    rows, dropped = score_rows(flags, bars, cal, universe, last_complete)
+    return rows, summarize_outcomes(rows), dropped
+
+
+def write_outcomes() -> str:
+    """Rewrite scouttiq_outcomes.jsonl from the whole flags log and return the printable summary."""
+    rows, summary, dropped = compute_outcomes()
+    p = OUTCOMES_PATH()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    os.replace(tmp, p)
+    text = format_outcomes(summary, dropped)
+    logger.info("SCOUTTIQ outcomes (%d scored rows):\n%s", len(rows), text)
+    return text
+
+
+async def _maybe_outcomes(today: str, now_et: datetime) -> None:
+    """After the nightly build, once per session day: score every logged flag. Never touches orders."""
+    if _RUN.get("outcomes_day") == today or _RUN["build_running"]:
+        return
+    if (now_et.hour, now_et.minute) < (16, 45):
+        return
+    if _time.time() - _RUN.get("outcomes_fail_ts", 0.0) < 1800:
+        return
+    try:
+        await asyncio.to_thread(write_outcomes)
+        _RUN["outcomes_day"] = today
+    except Exception:
+        logger.exception("scouttiq outcome scoring failed (will retry in 30 min)")
+        _RUN["outcomes_fail_ts"] = _time.time()
+
+
 async def _maybe_build(today: str, now_et: datetime) -> None:
     """After the close, once per session day, rebuild the base in a worker thread."""
     if _RUN["build_running"] or _RUN["build_day"] == today:
@@ -1220,6 +1402,7 @@ async def monitor_scouttiq() -> None:
                     if mode() == "on":
                         await _exit_pass(today, now_et, sessions)
                     await _maybe_build(today, now_et)
+                    await _maybe_outcomes(today, now_et)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1252,7 +1435,9 @@ if __name__ == "__main__":
         raw = asyncio.run(fetch_prices([r["t"] for r in b["rows"]], today, _env("SCOUTTIQ_FEED", "iex")))
         cyc = full_cycle(b["rows"], valid_prices(raw, today))
         print({k: (v if k != "r5" else len(v)) for k, v in cyc.items()})
+    elif cmd == "outcomes":
+        print(write_outcomes())
     elif cmd == "selftest":
         sys.exit(_selftest())
     else:
-        print("usage: python -m backend.scouttiq [build|status|flags-now|selftest]")
+        print("usage: python -m backend.scouttiq [build|status|flags-now|outcomes|selftest]")

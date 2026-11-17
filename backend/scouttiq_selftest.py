@@ -187,6 +187,35 @@ def test_c3_spec(sq):
     check("default mode is spec", sq.c3_mode() == "spec")
 
 
+def test_outcomes(sq):
+    sessions = sq.weekday_sessions(datetime(2026, 11, 2).date(), datetime(2026, 12, 31).date())
+    universe = ["U%02d" % i for i in range(30)]
+    d0 = "2026-11-09"
+    ex5, ex7 = sq.session_offset(sessions, d0, 5), sq.session_offset(sessions, d0, 7)
+    bars = {u: {d0: 10.0, ex5: 10.0, ex7: 10.0} for u in universe}                 # flat universe
+    bars["AAA"] = {d0: 10.0, ex5: 11.0, ex7: 12.0}                                  # taken
+    bars["BBB"] = {d0: 10.0, ex5: 9.0, ex7: 9.5}                                    # skipped for the cap
+    bars["CCC"] = {d0: 10.0, ex5: 25.0, ex7: 25.0}                                  # split-guard drop
+    flags = [{"date": d0, "symbol": "AAA", "version": "A", "flag_price": 10.0, "taken": True},
+             {"date": d0, "symbol": "BBB", "version": "B", "flag_price": 10.0, "taken": False, "why_not": "max_new_per_day"},
+             {"date": d0, "symbol": "CCC", "version": "A", "flag_price": 10.0, "taken": False, "why_not": "repeat_within_5_sessions"}]
+    rows, dropped = sq.score_rows(flags, bars, sessions, universe, ex7)
+    by = {(r["symbol"], r["horizon"]): r for r in rows}
+    check("taken 5d net = +10% - 0.30% cost", abs(by[("AAA", 5)]["net"] - 0.097) < 1e-9, str(by.get(("AAA", 5))))
+    check("taken 7d net", abs(by[("AAA", 7)]["net"] - 0.197) < 1e-9)
+    check("excess = stock minus flat universe", abs(by[("AAA", 5)]["excess"] - 0.10) < 1e-9)
+    check("skipped_cap flag scored with its own category", by[("BBB", 5)]["category"] == "skipped_cap" and abs(by[("BBB", 5)]["net"] - (-0.103)) < 1e-9)
+    check("split-guard observations dropped and counted", ("CCC", 5) not in by and dropped == 2)
+    rows2, _ = sq.score_rows(flags, bars, sessions, universe, ex5)
+    check("incomplete horizons are not scored", all(r["horizon"] == 5 for r in rows2))
+    summ = sq.summarize_outcomes(rows)
+    g = [x for x in summ if x["category"] == "taken" and x["version"] == "ALL" and x["horizon"] == 5][0]
+    check("summary groups taken / 5d", g["n"] == 1 and abs(g["mean_net"] - 0.097) < 1e-9 and g["hit"] == 1.0)
+    check("summary prints", "skipped_cap" in sq.format_outcomes(summ, dropped))
+    check("categories", sq.flag_category({"taken": False, "why_not": "shadow"}) == "shadow"
+          and sq.flag_category({"taken": False, "why_not": "qty_lt_1"}) == "skipped_other")
+
+
 def test_guard_and_flow(sq):
     tmp = tempfile.mkdtemp()
     os.environ["DATA_DIR"] = tmp
@@ -356,7 +385,7 @@ def test_guard_and_flow(sq):
 
 def run() -> int:
     from backend import scouttiq as sq
-    for fn in (test_rule, test_eps, test_rows, test_sec_parse, test_c3_spec, test_guard_and_flow):
+    for fn in (test_rule, test_eps, test_rows, test_sec_parse, test_c3_spec, test_outcomes, test_guard_and_flow):
         try:
             fn(sq)
         except Exception as exc:
