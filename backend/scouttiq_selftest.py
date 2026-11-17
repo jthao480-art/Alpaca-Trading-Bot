@@ -160,6 +160,33 @@ def test_sec_parse(sq):
     check("EPS rows from 10-Q/10-K only", len(sq.extract_eps(facts)) == 1)
 
 
+def test_c3_spec(sq):
+    # acceptance times: before open / during session stay on the filing day, after 16:00 ET moves to the next session
+    check("pre-market filing reacts same day", sq.reaction_date("2026-11-12", "2026-11-12T12:30:00.000Z") == "2026-11-12")
+    check("after-close filing reacts next session", sq.reaction_date("2026-11-12", "2026-11-12T21:05:33.000Z") == "2026-11-13")
+    check("Friday after-close filing reacts Monday", sq.reaction_date("2026-11-13", "2026-11-13T22:10:00.000Z") == "2026-11-16")
+    check("no acceptance time falls back to the filing date", sq.reaction_date("2026-11-12", None) == "2026-11-12")
+    check("weekend filing date rolls to Monday", sq.reaction_date("2026-11-14", None) == "2026-11-16")
+    acc = {"2025-11-05": "2025-11-05T21:30:00.000Z", "2025-11-12": "2025-11-12T13:00:00.000Z", "2026-02-10": "2026-02-10T13:00:00.000Z"}
+    spec = sq.report_basis_dates(["2025-11-05", "2025-11-12", "2026-02-10"], acc, "spec")
+    check("20-session dedupe keeps the first of a cluster", spec == ["2025-11-06", "2026-02-10"], str(spec))
+    legacy = sq.report_basis_dates(["2025-11-05", "2025-11-12", "2026-02-10"], acc, "legacy")
+    check("legacy mode returns raw filing dates", legacy == ["2025-11-05", "2025-11-12", "2026-02-10"], str(legacy))
+    # end to end: an after-close filer a year ago lands on the NEXT session + 364 days
+    due_spec = sq.report_due_dates(sq.report_basis_dates(["2025-11-12"], {"2025-11-12": "2025-11-12T21:05:00.000Z"}, "spec"), "2026-11-13")
+    due_legacy = sq.report_due_dates(sq.report_basis_dates(["2025-11-12"], {"2025-11-12": "2025-11-12T21:05:00.000Z"}, "legacy"), "2026-11-13")
+    check("spec due date is one weekday later than legacy for an after-close filer", due_spec == {"2026-11-12"} and due_legacy == {"2026-11-11"}, "%s %s" % (due_spec, due_legacy))
+    js = {"filings": {"recent": {"form": ["8-K", "8-K", "10-Q"], "filingDate": ["2026-08-04", "2026-08-06", "2026-08-05"],
+                                 "items": ["2.02,9.01", "5.02", ""], "acceptanceDateTime": ["2026-08-04T20:11:00.000Z", "2026-08-06T12:00:00.000Z", "x"]}}}
+    check("parse_accept keeps only Item 2.02 acceptance times", sq.parse_accept(js) == {"2026-08-04": "2026-08-04T20:11:00.000Z"}, str(sq.parse_accept(js)))
+    os.environ["SCOUTTIQ_C3_MODE"] = "legacy"
+    check("mode switch to legacy", sq.c3_mode() == "legacy")
+    os.environ["SCOUTTIQ_C3_MODE"] = "nonsense"
+    check("bad mode falls back to spec", sq.c3_mode() == "spec")
+    del os.environ["SCOUTTIQ_C3_MODE"]
+    check("default mode is spec", sq.c3_mode() == "spec")
+
+
 def test_guard_and_flow(sq):
     tmp = tempfile.mkdtemp()
     os.environ["DATA_DIR"] = tmp
@@ -329,7 +356,7 @@ def test_guard_and_flow(sq):
 
 def run() -> int:
     from backend import scouttiq as sq
-    for fn in (test_rule, test_eps, test_rows, test_sec_parse, test_guard_and_flow):
+    for fn in (test_rule, test_eps, test_rows, test_sec_parse, test_c3_spec, test_guard_and_flow):
         try:
             fn(sq)
         except Exception as exc:

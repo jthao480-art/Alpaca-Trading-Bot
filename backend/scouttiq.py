@@ -530,6 +530,77 @@ def parse_submissions(js: dict) -> tuple[list[str], list[tuple[str, str]], list[
     return d202, periodic, older
 
 
+def parse_accept(js: dict) -> dict[str, str]:
+    """{filing_date: earliest acceptanceDateTime} for 8-K / 8-K/A filings carrying Item 2.02."""
+    rec = (js.get("filings") or {}).get("recent") or js
+    forms, dates, items, acc = rec.get("form") or [], rec.get("filingDate") or [], rec.get("items") or [], rec.get("acceptanceDateTime") or []
+    out: dict[str, str] = {}
+    for i, f in enumerate(forms):
+        it = items[i] if i < len(items) else ""
+        if f in ("8-K", "8-K/A") and "2.02" in str(it) and i < len(acc) and acc[i] and i < len(dates):
+            if dates[i] not in out or acc[i] < out[dates[i]]:
+                out[dates[i]] = acc[i]
+    return out
+
+
+def c3_mode() -> str:
+    """SCOUTTIQ_C3_MODE: 'spec' (default) = reaction date + 20-session dedupe; 'legacy' = raw Item 2.02 filing dates."""
+    m = _env("SCOUTTIQ_C3_MODE", "spec").strip().lower()
+    return m if m in ("spec", "legacy") else "spec"
+
+
+def _next_weekday(d):
+    d = d + timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
+def _weekdays_between(a, b) -> int:
+    """Number of weekdays from a (exclusive) to b (inclusive); a < b."""
+    n, d = 0, a
+    while d < b:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            n += 1
+    return n
+
+
+def reaction_date(filing_date: str, accepted: Optional[str]) -> str:
+    """Session whose price reacts to an Item 2.02 filing: the filing day, or the next weekday if it was accepted
+    at/after the 16:00 ET close (or on a weekend). Without an acceptance time the filing date is used."""
+    d = _d(filing_date)
+    if accepted:
+        try:
+            dt = datetime.fromisoformat(str(accepted).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            et = dt.astimezone(ET)
+            d = et.date()
+            if (et.hour, et.minute) >= (16, 0):
+                d = _next_weekday(d)
+        except Exception:
+            d = _d(filing_date)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d.isoformat()
+
+
+def report_basis_dates(d202: list[str], accepted: Optional[dict] = None, mode: Optional[str] = None) -> list[str]:
+    """Dates fed to report_due_dates(). 'legacy' = the raw filing dates. 'spec' = reaction dates, keeping the first of
+    any cluster closer than 20 sessions (e.g. an 8-K/A shortly after the original)."""
+    if (mode or c3_mode()) == "legacy":
+        return list(d202)
+    accepted = accepted or {}
+    rd = sorted({reaction_date(x, accepted.get(x)) for x in d202 if x})
+    kept: list[str] = []
+    for x in rd:
+        if kept and _weekdays_between(_d(kept[-1]), _d(x)) < 20:
+            continue
+        kept.append(x)
+    return kept
+
+
 EPS_TAGS = ("EarningsPerShareDiluted", "EarningsPerShareBasicAndDiluted", "EarningsPerShareBasic")
 
 
@@ -557,6 +628,7 @@ def refresh_company(sec: SecClient, store: dict, cik: str, today: str, force_fac
         return False
     js = r.json()
     d202, periodic, older = parse_submissions(js)
+    acc = parse_accept(js)
     oldest = min([x for x in (js.get("filings", {}).get("recent", {}).get("filingDate") or [])] or [today])
     if older and oldest > (_d(today) - timedelta(days=430)).isoformat():
         for name in older[:2]:
@@ -564,7 +636,15 @@ def refresh_company(sec: SecClient, store: dict, cik: str, today: str, force_fac
             if rr is not None:
                 d2, p2, _ = parse_submissions(rr.json())
                 d202 += d2
+                for k, v in parse_accept(rr.json()).items():
+                    if k not in acc or v < acc[k]:
+                        acc[k] = v
     rec["d202"] = sorted(set(d202) | set(rec.get("d202") or []))
+    merged = dict(rec.get("d202a") or {})
+    for k, v in acc.items():
+        if k not in merged or v < merged[k]:
+            merged[k] = v
+    rec["d202a"] = merged
     latest_per = periodic[0][1] if periodic else ""
     need_facts = force_facts or not rec.get("eps") or (latest_per and latest_per != rec.get("per"))
     if need_facts:
@@ -776,7 +856,7 @@ def build_base(force: bool = False, sec_budget_calls: Optional[int] = None) -> d
     for c in cands:
         rec = store.get(c.get("cik") or "")
         c["ttm"] = c["ttm_prev"] = None
-        c["d202"] = (rec or {}).get("d202") or []
+        c["d202"] = report_basis_dates((rec or {}).get("d202") or [], (rec or {}).get("d202a") or {})
         if rec and rec.get("eps"):
             pair = ttm_pair(quarterly_eps(rec["eps"]), formation)
             if pair:
@@ -785,7 +865,7 @@ def build_base(force: bool = False, sec_budget_calls: Optional[int] = None) -> d
     st = built["stats"]
     st.update(candidates=len(cands), sec_pending=sum(1 for c in cands if c.get("cik") and c["ttm"] is None),
               no_cik=sum(1 for c in cands if not c.get("cik")), feed=feed, split_source="heuristic" if no_split_api else "alpaca",
-              sec_calls=sec.calls, seconds=round(_time.time() - t0, 1), built_at=datetime.now(timezone.utc).isoformat())
+              c3_mode=c3_mode(), sec_calls=sec.calls, seconds=round(_time.time() - t0, 1), built_at=datetime.now(timezone.utc).isoformat())
     out = {"formation_date": formation, "stats": st, "rows": built["rows"]}
     _write_json(data_dir() / "scouttiq_base.json", out)
     try:
@@ -968,14 +1048,16 @@ async def _live_cycle(base: dict, today: str, now_et: datetime, sessions: list[s
         if cyc["skipped"]:
             return
         _RUN["cutoff"], _RUN["cutoff_ts"] = cyc["cutoff"], _time.time()
-        picks = [(t, "A", prices[t], {"r5": round(cyc["r5"][t], 5)}) for t in cyc["flags"]]
+        picks = [(t, "A", prices[t], {"r5": round(cyc["r5"][t], 5), "cutoff": round(cyc["cutoff"], 5)}) for t in cyc["flags"]]
     else:
         if _RUN["cutoff"] is None or _time.time() - _RUN["cutoff_ts"] > 20 * 60:
             return
         watch = [r for r in rows if r["c2"] or r["c3"]]
         raw = await fetch_prices([r["t"] for r in watch], today, feed)
         prices = valid_prices(raw, today)
-        picks = [(t, "B", trig, {"r5": round(r5, 5)}) for t, r5, trig in version_b(watch, prices, _RUN["cutoff"])]
+        picks = [(t, "B", trig, {"r5": round(r5, 5), "cutoff": round(_RUN["cutoff"], 5),
+                                 "cutoff_age_s": int(_time.time() - _RUN["cutoff_ts"])})
+                 for t, r5, trig in version_b(watch, prices, _RUN["cutoff"])]
     byt = {r["t"]: r for r in rows}
     for t, ver, px, info in picks:
         if t in st["flagged_today"]["syms"]:
