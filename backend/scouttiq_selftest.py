@@ -187,6 +187,16 @@ def test_c3_spec(sq):
     check("default mode is spec", sq.c3_mode() == "spec")
 
 
+def test_close_times(sq):
+    check("normal day closes 16:00", sq.close_hm("2026-11-30") == (16, 0) and sq.exit_trigger_hm("2026-11-30") == (15, 56))
+    check("day after Thanksgiving defaults to 13:00", sq.close_hm("2026-11-27") == (13, 0) and sq.exit_trigger_hm("2026-11-27") == (12, 56))
+    check("Christmas Eve defaults to 13:00", sq.close_hm("2026-12-24") == (13, 0))
+    sq._CLOSES["2026-12-01"] = "13:00"
+    check("calendar close time wins over the default", sq.close_hm("2026-12-01") == (13, 0) and sq.exit_trigger_hm("2026-12-01") == (12, 56))
+    sq._CLOSES.pop("2026-12-01", None)
+    check("no override leaves a normal day alone", sq.close_hm("2026-12-01") == (16, 0))
+
+
 def test_outcomes(sq):
     sessions = sq.weekday_sessions(datetime(2026, 11, 2).date(), datetime(2026, 12, 31).date())
     universe = ["U%02d" % i for i in range(30)]
@@ -237,10 +247,16 @@ def test_guard_and_flow(sq):
         calls["sells"].append((sym, qty))
         return "sell-" + sym
 
+    async def _buy_risk_check(sym, qty, px):
+        if calls.get("risk_fail"):
+            return False, calls["risk_fail"], 0.0
+        return True, "ok", float(qty)
+
     async def _get_open_positions():
         return [{"symbol": s, "qty": str(p["qty"]), "unrealized_plpc": "0.0"} for s, p in sq.load_state()["positions"].items()] + list(calls["extra_live"])
 
     ex.place_market_buy, ex.get_latest_price, ex.place_market_sell, ex._get_open_positions = place_market_buy, get_latest_price, place_market_sell, _get_open_positions
+    ex._buy_risk_check = _buy_risk_check
     led = types.ModuleType("backend.services.trade_ledger_service")
     store = {}
     led.load_ledger = lambda: store
@@ -370,6 +386,29 @@ def test_guard_and_flow(sq):
         sq._today_et = lambda: "2026-12-30"
         sq.append_flag_log({"ts": "x", "date": "2026-11-18", "symbol": "HHH", "taken": True, "exit_date": "2026-11-20"})
         check("fallback ignores an entry whose exit date has passed", not sq.is_held("HHH"))
+        # the real refusal reason is logged, nothing is registered or bought
+        calls["risk_fail"] = "cash_reserve_floor_hit"
+        st = sq.load_state()
+        sq._roll_counters(st, "2026-11-18")
+        nb = len(calls["buys"])
+        await sq._enter("RRR", 10.0, "A", {}, st, "2026-11-18", sessions)
+        last = [json.loads(x) for x in sq.FLAGS_PATH().read_text().strip().splitlines()][-1]
+        check("risk refusal reason is logged, not order_failed", last.get("symbol") == "RRR" and last.get("why_not") == "cash_reserve_floor_hit", str(last))
+        check("risk refusal places no order and holds nothing", len(calls["buys"]) == nb and not sq.is_held("RRR"))
+        calls["risk_fail"] = None
+        # half-day exit: a position due on 2026-11-27 sells at 12:56, not 15:56
+        sq._today_et = lambda: "2026-11-27"
+        st = sq.load_state()
+        st["positions"]["HDD"] = {"entry_date": "2026-11-17", "exit_date": "2026-11-27", "qty": 5, "flag_price": 10.0,
+                                  "version": "A", "state": "open", "ts": datetime.now(timezone.utc).isoformat()}
+        sq.save_state(st)
+        ns = len(calls["sells"])
+        sq._RUN["last_live_check"] = 0.0
+        await sq._exit_pass("2026-11-27", datetime(2026, 11, 27, 12, 50, tzinfo=sq.ET), sessions)
+        check("half day: no sale at 12:50", len(calls["sells"]) == ns and sq.is_held("HDD"))
+        sq._RUN["last_live_check"] = 0.0
+        await sq._exit_pass("2026-11-27", datetime(2026, 11, 27, 12, 57, tzinfo=sq.ET), sessions)
+        check("half day: sold at 12:57 ET", len(calls["sells"]) == ns + 1 and calls["sells"][-1][0] == "HDD" and not sq.is_held("HDD"), str(calls["sells"][-2:]))
         # shadow mode never trades
         os.environ["SCOUTTIQ_MODE"] = "shadow"
         n = len(calls["buys"])
@@ -385,7 +424,7 @@ def test_guard_and_flow(sq):
 
 def run() -> int:
     from backend import scouttiq as sq
-    for fn in (test_rule, test_eps, test_rows, test_sec_parse, test_c3_spec, test_outcomes, test_guard_and_flow):
+    for fn in (test_rule, test_eps, test_rows, test_sec_parse, test_c3_spec, test_close_times, test_outcomes, test_guard_and_flow):
         try:
             fn(sq)
         except Exception as exc:

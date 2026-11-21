@@ -673,12 +673,47 @@ def _trading_url() -> str:
     return str(getattr(config, "ALPACA_BASE_URL", "https://paper-api.alpaca.markets")).rstrip("/")
 
 
+_CLOSES: dict[str, str] = {}      # session date -> "HH:MM" close (13:00 on early-close days), filled by fetch_calendar_sync
+
+
+def _default_close_hm(day: str) -> tuple[int, int]:
+    """Fallback when the calendar did not give a close time: the usual 13:00 ET early closes."""
+    d = _d(day)
+    if d.month == 11 and d.weekday() == 4 and 23 <= d.day <= 29:      # day after Thanksgiving
+        return (13, 0)
+    if d.month == 12 and d.day == 24 and d.weekday() < 5:             # Christmas Eve
+        return (13, 0)
+    return (16, 0)
+
+
+def close_hm(day: str) -> tuple[int, int]:
+    s = _CLOSES.get(day)
+    if s:
+        try:
+            h, m = str(s).split(":")[:2]
+            return (int(h), int(m))
+        except Exception:
+            pass
+    return _default_close_hm(day)
+
+
+def exit_trigger_hm(day: str) -> tuple[int, int]:
+    """The 'sell at the close' time: 4 minutes before that day's close (15:56 normally, 12:56 on a 13:00 early close)."""
+    h, m = close_hm(day)
+    t = h * 60 + m - 4
+    return (t // 60, t % 60)
+
+
 def fetch_calendar_sync(start: str, end: str) -> list[str]:
     import httpx
     try:
         r = httpx.get(_trading_url() + "/v2/calendar", params={"start": start, "end": end}, headers=_alpaca_headers(), timeout=30)
         if r.status_code == 200:
-            return sorted(x["date"] for x in r.json())
+            js = r.json()
+            for x in js:
+                if x.get("date") and x.get("close"):
+                    _CLOSES[x["date"]] = str(x["close"])
+            return sorted(x["date"] for x in js)
     except Exception:
         logger.exception("scouttiq calendar fetch failed")
     return []
@@ -958,6 +993,27 @@ async def _broker_qty(sym: str) -> Optional[float]:
         return None
 
 
+async def _risk_refusal(sym: str, qty: int, px: float) -> Optional[str]:
+    """Why the broker-side risk check (cash reserve floor, position cap, leverage ...) would refuse this buy, else None."""
+    try:
+        from backend.execution import _buy_risk_check
+    except Exception:
+        return None
+    try:
+        ok, why, adj = await _buy_risk_check(sym, qty, px)
+    except Exception:
+        logger.exception("scouttiq risk pre-check failed for %s (continuing)", sym)
+        return None
+    if not ok:
+        return str(why or "risk_check_refused")
+    try:
+        if int(adj) < 1:
+            return "qty_after_risk_lt_1"
+    except Exception:
+        pass
+    return None
+
+
 async def _enter(sym: str, flag_price: float, version: str, info: dict, st: dict, today: str, sessions: list[str]) -> None:
     """Place the buy for one new flag (mode 'on') and register the position."""
     from backend.execution import place_market_buy, get_latest_price
@@ -982,8 +1038,12 @@ async def _enter(sym: str, flag_price: float, version: str, info: dict, st: dict
     else:
         px = await get_latest_price(sym) or flag_price
         qty = int(usd // px) if px else 0
+        risk_why = await _risk_refusal(sym, qty, px) if qty >= 1 else None
         if qty < 1:
             rec["why_not"] = "qty_lt_1"
+        elif risk_why:
+            rec["why_not"] = risk_why
+            logger.warning("scouttiq: not buying %s - risk check says %s", sym, risk_why)
         else:
             hold_n = hold_sessions()
             exit_date = session_offset(sessions, today, hold_n)
@@ -1080,7 +1140,7 @@ async def _exit_pass(today: str, now_et: datetime, sessions: list[str]) -> None:
     from backend.execution import place_market_sell, _get_open_positions
     stop_pct = _env_f("SCOUTTIQ_HARD_STOP_PCT", 0.0)               # optional safety net; 0 = off (the scored rule has none)
     hm = (now_et.hour, now_et.minute)
-    due = any(p.get("exit_date") and (today > p["exit_date"] or (today == p["exit_date"] and hm >= (15, 56)))
+    due = any(p.get("exit_date") and (today > p["exit_date"] or (today == p["exit_date"] and hm >= exit_trigger_hm(today)))
               for p in st["positions"].values())
     pending = any(p.get("state") == "pending" for p in st["positions"].values())
     if not (due or pending or stop_pct > 0) and _time.time() - _RUN.get("last_live_check", 0.0) < 900:
@@ -1125,7 +1185,7 @@ async def _exit_pass(today: str, now_et: datetime, sessions: list[str]) -> None:
         ex = pos.get("exit_date") or ""
         if ex and today > ex:
             reason = "scouttiq_5d_exit_overdue"
-        elif ex and today == ex and (now_et.hour, now_et.minute) >= (15, 56):
+        elif ex and today == ex and (now_et.hour, now_et.minute) >= exit_trigger_hm(today):
             reason = "scouttiq_5d_exit"
         if reason is None and stop_pct > 0 and live is not None:
             try:
@@ -1135,7 +1195,7 @@ async def _exit_pass(today: str, now_et: datetime, sessions: list[str]) -> None:
                 pass
         if reason is None:
             continue
-        if not (9, 31) <= (now_et.hour, now_et.minute) < (16, 0):
+        if not (9, 31) <= (now_et.hour, now_et.minute) < close_hm(today):
             continue
         tok = SCOUTTIQ_CTX.set(True)
         try:
@@ -1387,7 +1447,7 @@ async def monitor_scouttiq() -> None:
                 sessions = await _sessions(today)
                 if today in sessions:
                     hm = (now_et.hour, now_et.minute)
-                    if (9, 35) <= hm < (16, 0):
+                    if (9, 35) <= hm < close_hm(today):
                         base = load_base()
                         if base is None:
                             _guard_log("nobase", "scouttiq: no base file yet (run `python -m backend.scouttiq build`)")
