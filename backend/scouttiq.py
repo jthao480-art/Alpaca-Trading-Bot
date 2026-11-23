@@ -120,6 +120,37 @@ def flags(base_rows, prices, decile=DECILE, split_guard=SPLIT_GUARD, min_frac=MI
     return [r["t"] for i, r, p, r5 in valid if (i in c1_idx) + r["c2"] + r["c3"] >= 2]
 
 
+def market_regime(base_rows, prices, min_valid: int = 50):
+    """LOG-ONLY market-stress tags for a scan: median 5-session return of the liquid universe (live price vs the base close
+    5 sessions back), share of names that are down over those 5 sessions, and the median move since the last close.
+    It never touches the rule, an entry or an exit; it only labels each flag so results can be split by market regime later."""
+    try:
+        r5, r1 = [], []
+        for r in base_rows:
+            p = prices.get(r["t"])
+            if not p or p <= 0 or r["b"] <= 0 or r["l"] <= 0 or abs(p / r["l"] - 1) > SPLIT_GUARD:
+                continue
+            r5.append(p / r["b"] - 1)
+            r1.append(p / r["l"] - 1)
+        if len(r5) < min_valid:
+            return None
+        r5.sort(); r1.sort()
+        mid = len(r5) // 2
+        med = lambda a: a[mid] if len(a) % 2 else (a[mid - 1] + a[mid]) / 2.0
+        return {"m5": round(med(r5), 5), "dn": round(sum(1 for v in r5 if v < 0) / len(r5), 4), "m1": round(med(r1), 5), "nv": len(r5)}
+    except Exception:
+        return None
+
+
+def regime_bucket(m5) -> str:
+    """Stress buckets for reporting only: stress = universe median 5-session return <= -5%, weak = -5%..-1%, calm = above -1%."""
+    try:
+        m5 = float(m5)
+    except Exception:
+        return "untagged"
+    return "stress" if m5 <= -0.05 else ("weak" if m5 <= -0.01 else "calm")
+
+
 def full_cycle(base_rows, prices, decile=DECILE, split_guard=SPLIT_GUARD, min_frac=MIN_VALID_FRAC):
     """Same rule as flags(), but also returns what Version B needs: the c1 cutoff and the r5 of each name.
 
@@ -959,7 +990,7 @@ def valid_prices(raw: dict[str, tuple[float, str]], today: str) -> dict[str, flo
 
 # ───────────────────────────── agent: entries, exits, loop ─────────────────────────────
 _RUN: dict[str, Any] = {"cutoff": None, "cutoff_ts": 0.0, "last_a": 0.0, "last_b": 0.0, "sessions": None, "sessions_day": "",
-                        "build_day": "", "build_running": False, "build_fail_ts": 0.0}
+                        "build_day": "", "build_running": False, "build_fail_ts": 0.0, "regime": None, "regime_ts": 0.0}
 
 
 async def _sessions(today: str) -> list[str]:
@@ -1108,7 +1139,8 @@ async def _live_cycle(base: dict, today: str, now_et: datetime, sessions: list[s
         if cyc["skipped"]:
             return
         _RUN["cutoff"], _RUN["cutoff_ts"] = cyc["cutoff"], _time.time()
-        picks = [(t, "A", prices[t], {"r5": round(cyc["r5"][t], 5), "cutoff": round(cyc["cutoff"], 5)}) for t in cyc["flags"]]
+        _RUN["regime"], _RUN["regime_ts"] = market_regime(rows, prices), _time.time()
+        picks = [(t, "A", prices[t], {"r5": round(cyc["r5"][t], 5), "cutoff": round(cyc["cutoff"], 5), "reg": _RUN["regime"]}) for t in cyc["flags"]]
     else:
         if _RUN["cutoff"] is None or _time.time() - _RUN["cutoff_ts"] > 20 * 60:
             return
@@ -1116,7 +1148,7 @@ async def _live_cycle(base: dict, today: str, now_et: datetime, sessions: list[s
         raw = await fetch_prices([r["t"] for r in watch], today, feed)
         prices = valid_prices(raw, today)
         picks = [(t, "B", trig, {"r5": round(r5, 5), "cutoff": round(_RUN["cutoff"], 5),
-                                 "cutoff_age_s": int(_time.time() - _RUN["cutoff_ts"])})
+                                 "cutoff_age_s": int(_time.time() - _RUN["cutoff_ts"]), "reg": _RUN.get("regime")})
                  for t, r5, trig in version_b(watch, prices, _RUN["cutoff"])]
     byt = {r["t"]: r for r in rows}
     for t, ver, px, info in picks:
@@ -1314,7 +1346,8 @@ def score_rows(flag_rows: list[dict], bars: dict, sessions: list[str], universe:
                     excess = (c1 / c0 - 1) - u
             out.append({"date": d, "symbol": sym, "version": r.get("version"), "category": flag_category(r), "horizon": h,
                         "exit_date": ex, "flag_price": round(px, 4), "exit_close": round(c1, 4),
-                        "net": round(gross - cost, 5), "excess": None if excess is None else round(excess, 5)})
+                        "net": round(gross - cost, 5), "excess": None if excess is None else round(excess, 5),
+                        "m5": (r.get("reg") or {}).get("m5")})
     return out, dropped
 
 
@@ -1332,6 +1365,36 @@ def summarize_outcomes(rows: list[dict]) -> list[dict]:
                     "median_net": statistics.median(nets), "hit": sum(1 for v in nets if v > 0) / len(nets),
                     "n_excess": len(ex), "mean_excess": (sum(ex) / len(ex)) if ex else None})
     return out
+
+
+def summarize_regime(rows: list[dict]) -> list[dict]:
+    """Counted flags (taken + skipped, never repeats) split by the market regime they were flagged in. Reporting only."""
+    import statistics
+    groups: dict = {}
+    for r in rows:
+        if r["category"] in ("repeat", "shadow"):
+            continue
+        groups.setdefault((regime_bucket(r.get("m5")), r["horizon"]), []).append(r)
+    out = []
+    for (b, h), rs in sorted(groups.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        nets = [x["net"] for x in rs]
+        ex = [x["excess"] for x in rs if x["excess"] is not None]
+        out.append({"bucket": b, "horizon": h, "n": len(rs), "days": len({x["date"] for x in rs}), "mean_net": sum(nets) / len(nets),
+                    "median_net": statistics.median(nets), "hit": sum(1 for v in nets if v > 0) / len(nets),
+                    "n_excess": len(ex), "mean_excess": (sum(ex) / len(ex)) if ex else None})
+    return out
+
+
+def format_regime(summary: list[dict]) -> str:
+    if not summary:
+        return ""
+    lines = ["", "by market regime at flag time (stress: universe 5-session median <= -5%; weak: -5%..-1%; calm: above -1%; untagged: flagged before tagging began)",
+             "hold regime     flags  days   mean_net  median   hit   excess_vs_universe(n)"]
+    for g in summary:
+        ex = "   n/a" if g["mean_excess"] is None else "%+6.2f%% (%d)" % (100 * g["mean_excess"], g["n_excess"])
+        lines.append("%2dd  %-10s %5d %5d  %+7.2f%% %+7.2f%% %4.0f%%   %s" % (
+            g["horizon"], g["bucket"], g["n"], g["days"], 100 * g["mean_net"], 100 * g["median_net"], 100 * g["hit"], ex))
+    return "\n".join(lines)
 
 
 def format_outcomes(summary: list[dict], dropped: int = 0) -> str:
@@ -1382,7 +1445,7 @@ def write_outcomes() -> str:
         for r in rows:
             f.write(json.dumps(r) + "\n")
     os.replace(tmp, p)
-    text = format_outcomes(summary, dropped)
+    text = format_outcomes(summary, dropped) + format_regime(summarize_regime(rows))
     logger.info("SCOUTTIQ outcomes (%d scored rows):\n%s", len(rows), text)
     return text
 

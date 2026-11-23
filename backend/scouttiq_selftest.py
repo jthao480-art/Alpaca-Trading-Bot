@@ -422,9 +422,47 @@ def test_guard_and_flow(sq):
     check("flag log written", p.exists() and len(p.read_text().strip().splitlines()) >= 4)
 
 
+def test_regime(sq):
+    # log-only market tags: a falling market, a calm one, too-few names, bad input
+    rows = [{"t": "S%03d" % i, "c2": 0, "c3": 0, "b": 100.0, "l": 97.0} for i in range(100)]
+    px_down = {r["t"]: 92.0 for r in rows}                    # -8% over 5 sessions, -5.15% since the last close
+    g = sq.market_regime(rows, px_down)
+    check("regime tags a falling market", g is not None and abs(g["m5"] + 0.08) < 1e-6 and g["dn"] == 1.0 and g["nv"] == 100, str(g))
+    check("regime m1 is the move since the last close", g is not None and abs(g["m1"] - (92.0 / 97.0 - 1)) < 1e-4, str(g))
+    px_up = {r["t"]: (103.0 if i % 2 else 99.0) for i, r in enumerate(rows)}
+    g2 = sq.market_regime(rows, px_up)
+    check("regime breadth is the share of names down", g2 is not None and g2["dn"] == 0.5, str(g2))
+    check("regime needs enough names", sq.market_regime(rows[:10], {r["t"]: 90.0 for r in rows[:10]}) is None)
+    check("regime survives bad input", sq.market_regime([{"t": "X"}], {"X": 1.0}) is None)
+    check("regime ignores split-sized jumps", sq.market_regime(rows, {r["t"]: 400.0 for r in rows}) is None)
+    check("bucket thresholds", [sq.regime_bucket(x) for x in (-0.08, -0.05, -0.03, -0.01, 0.0, 0.04, None, "x")] ==
+          ["stress", "stress", "weak", "weak", "calm", "calm", "untagged", "untagged"])
+    # the tag must never change which names flag
+    base = [{"t": "A%02d" % i, "c2": 1 if i >= 54 else 0, "c3": 0, "b": 100.0, "l": 100.0} for i in range(60)]
+    pr = {r["t"]: 100.0 - i * 0.5 for i, r in enumerate(base)}
+    f1 = sq.flags(base, pr)
+    sq.market_regime(base, pr)
+    check("regime tagging leaves the rule untouched", f1 == sq.flags(base, pr) and len(f1) > 0)
+    # the scorer carries the tag and the summary splits by it
+    sessions = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06", "2026-11-09", "2026-11-10"]
+    flag_rows = [{"symbol": "AAA", "date": "2026-11-02", "flag_price": 10.0, "taken": True, "version": "A", "reg": {"m5": -0.09}},
+                 {"symbol": "BBB", "date": "2026-11-02", "flag_price": 10.0, "taken": False, "why_not": "max_new_per_day", "version": "A", "reg": {"m5": 0.02}},
+                 {"symbol": "CCC", "date": "2026-11-02", "flag_price": 10.0, "taken": True, "version": "A"}]
+    bars = {s: {d: 10.0 for d in sessions} for s in ("AAA", "BBB", "CCC")}
+    bars["AAA"]["2026-11-09"] = 9.0
+    bars["BBB"]["2026-11-09"] = 10.5
+    out, _ = sq.score_rows(flag_rows, bars, sessions, [], "2026-11-10", horizons=(5,))
+    ms = {o["symbol"]: o["m5"] for o in out}
+    check("scored rows carry the regime tag", ms.get("AAA") == -0.09 and ms.get("BBB") == 0.02 and ms.get("CCC") is None, str(ms))
+    sm = {x["bucket"]: x for x in sq.summarize_regime(out)}
+    check("regime summary splits stress / calm / untagged", set(sm) == {"stress", "calm", "untagged"} and sm["stress"]["n"] == 1, str(sm))
+    check("regime summary stress mean is the loss", sm["stress"]["mean_net"] < -0.09 and sm["calm"]["mean_net"] > 0.04, str(sm))
+    check("regime text prints", "stress" in sq.format_regime(sq.summarize_regime(out)) and sq.format_regime([]) == "")
+
+
 def run() -> int:
     from backend import scouttiq as sq
-    for fn in (test_rule, test_eps, test_rows, test_sec_parse, test_c3_spec, test_close_times, test_outcomes, test_guard_and_flow):
+    for fn in (test_rule, test_eps, test_rows, test_sec_parse, test_c3_spec, test_close_times, test_outcomes, test_regime, test_guard_and_flow):
         try:
             fn(sq)
         except Exception as exc:

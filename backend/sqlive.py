@@ -254,6 +254,18 @@ def main() -> None:
     ohlc = fetch_ohlc_sync(syms, start, end_ts, sq._env("SCOUTTIQ_BARS_FEED", "sip"))
     res = run_study(flags, ohlc, cal, universe, last_complete, sq.session_offset)
     print(format_study(res))
+    # the same study per market regime (tags are logged at flag time; flags before tagging began are 'untagged')
+    buckets: dict = {}
+    for f in flags:
+        buckets.setdefault(sq.regime_bucket((f.get("reg") or {}).get("m5")), []).append(f)
+    if len([b for b in buckets if b != "untagged"]) >= 1:
+        for b in ("stress", "weak", "calm", "untagged"):
+            sub = buckets.get(b) or []
+            if len(sub) < 12:
+                print("\n--- regime %s: %d flags, too few for a table (needs 12) ---" % (b, len(sub)))
+                continue
+            print("\n################ regime: %s (%d flags) ################" % (b, len(sub)))
+            print(format_study(run_study(sub, ohlc, cal, universe, last_complete, sq.session_offset)))
 
 
 if __name__ == "__main__":
